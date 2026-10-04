@@ -1,9 +1,26 @@
+param(
+    [switch]$Continuous,
+    [ValidateRange(1, 240)]
+    [double]$Hz = 20
+)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = $PSScriptRoot
 $scanner = Join-Path $projectRoot 'target\release\roblox-memory-scanner.exe'
+$buildInputs = @(
+    Get-Item -LiteralPath (Join-Path $projectRoot 'Cargo.toml')
+    Get-Item -LiteralPath (Join-Path $projectRoot 'Cargo.lock')
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src') -Filter '*.rs' -File -Recurse
+)
+$needsBuild = -not (Test-Path -LiteralPath $scanner -PathType Leaf)
 
-if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
+if (-not $needsBuild) {
+    $scannerTimestamp = (Get-Item -LiteralPath $scanner).LastWriteTimeUtc
+    $needsBuild = $null -ne ($buildInputs | Where-Object LastWriteTimeUtc -GT $scannerTimestamp | Select-Object -First 1)
+}
+
+if ($needsBuild) {
     Push-Location $projectRoot
     try {
         & cargo build --release
@@ -14,6 +31,12 @@ if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
     finally {
         Pop-Location
     }
+}
+
+if ($Continuous) {
+    $invariantHz = $Hz.ToString([Globalization.CultureInfo]::InvariantCulture)
+    & $scanner stream-telemetry --hz $invariantHz
+    exit $LASTEXITCODE
 }
 
 $lines = @(& $scanner locate-humanoid-roots)

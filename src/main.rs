@@ -5,7 +5,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::{size_of, zeroed};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Handle = *mut c_void;
 
@@ -123,6 +124,73 @@ struct Candidate {
     position: [f32; 3],
 }
 
+#[derive(Clone, Debug)]
+pub enum TelemetryUnavailableReason {
+    Discovering,
+    RobloxUnavailable(String),
+    DiscoveryFailed(String),
+    TargetInvalid(String),
+    PositionCopiesDisagree,
+}
+
+#[derive(Clone, Debug)]
+pub enum TelemetryValidity {
+    Valid,
+    Unavailable(TelemetryUnavailableReason),
+}
+
+#[derive(Clone, Debug)]
+pub struct Telemetry {
+    pub username: Option<String>,
+    pub user_id: Option<u64>,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub z: Option<f32>,
+    pub sample_timestamp: Option<SystemTime>,
+    pub validity: TelemetryValidity,
+}
+
+struct RootCandidate {
+    humanoid: usize,
+    primitive: usize,
+    part: Option<usize>,
+    model: Option<usize>,
+    name: Option<String>,
+    position: [f32; 3],
+}
+
+struct ResolvedLocalPlayer {
+    pid: u32,
+    process: ProcessHandle,
+    username: String,
+    user_id: Option<u64>,
+    humanoid: usize,
+    primitive: usize,
+    part: usize,
+    model: usize,
+    player: usize,
+    humanoid_vtable: usize,
+    primitive_vtable: usize,
+    part_vtable: usize,
+    model_vtable: usize,
+    player_vtable: usize,
+}
+
+struct DiscoveryResult {
+    target: ResolvedLocalPlayer,
+    module_base: usize,
+    humanoid_count: usize,
+    player_count: usize,
+    player_names: Vec<String>,
+    read_failures: usize,
+    roots: Vec<RootCandidate>,
+}
+
+enum PollError {
+    TargetInvalid(String),
+    PositionCopiesDisagree,
+}
+
 fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  roblox-memory-scanner survey [--pid PID]");
@@ -145,6 +213,7 @@ fn usage() -> ! {
         "  roblox-memory-scanner inspect-object-pointers --address ADDRESS [--bytes N] [--pid PID]"
     );
     eprintln!("  roblox-memory-scanner locate-humanoid-roots [--pid PID]");
+    eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ]");
     std::process::exit(2);
 }
 
@@ -362,6 +431,12 @@ fn position_is_plausible(position: &[f32; 3]) -> bool {
         .iter()
         .all(|v| v.is_finite() && v.abs() <= 1_000_000.0)
         && position.iter().any(|v| v.abs() >= 1.0)
+}
+
+fn position_is_valid(position: &[f32; 3]) -> bool {
+    position
+        .iter()
+        .all(|value| value.is_finite() && value.abs() <= 1_000_000.0)
 }
 
 fn candidate_at(
@@ -1145,7 +1220,12 @@ fn read_instance_name(process: &ProcessHandle, instance: usize) -> Option<String
     }
 }
 
-fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
+fn read_pointer(process: &ProcessHandle, address: usize) -> Option<usize> {
+    let mut bytes = [0u8; 8];
+    read_exact(process, address, &mut bytes).then(|| read_u64(&bytes, 0) as usize)
+}
+
+fn discover_local_player(pid: u32) -> Result<DiscoveryResult, String> {
     let process = open_read_only(pid)?;
     let modules = image_modules(&process);
     let module = modules.into_iter().find(|(base, size)| {
@@ -1180,35 +1260,254 @@ fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
 
     let mut roots = Vec::new();
     for humanoid in humanoids.iter().copied() {
-        let mut pointer_bytes = [0u8; 8];
-        if !read_exact(
-            &process,
-            humanoid + HUMANOID_ROOT_PRIMITIVE_OFFSET,
-            &mut pointer_bytes,
-        ) {
+        let Some(primitive) = read_pointer(&process, humanoid + HUMANOID_ROOT_PRIMITIVE_OFFSET)
+        else {
+            continue;
+        };
+        if primitive == 0 || read_pointer(&process, primitive) != Some(primitive_vtable) {
             continue;
         }
-        let primitive = read_u64(&pointer_bytes, 0) as usize;
-        if primitive == 0 || !read_exact(&process, primitive, &mut pointer_bytes) {
-            continue;
+        if let Ok(position) = read_agreed_position(&process, primitive) {
+            roots.push(RootCandidate {
+                humanoid,
+                primitive,
+                part: None,
+                model: None,
+                name: None,
+                position,
+            });
         }
-        if read_u64(&pointer_bytes, 0) as usize != primitive_vtable {
-            continue;
+    }
+
+    let primitive_targets: Vec<usize> = roots.iter().map(|root| root.primitive).collect();
+    let (primitive_references, second_read_failures) =
+        scan_private_writable_targets(&process, &primitive_targets);
+    for (root_index, references) in primitive_references.iter().enumerate() {
+        for pointer_address in references {
+            let Some(part) = pointer_address.checked_sub(PART_PRIMITIVE_FIELD_OFFSET) else {
+                continue;
+            };
+            if read_pointer(&process, part + PART_SUBOBJECT_OFFSET) != Some(part_vtable) {
+                continue;
+            }
+            let Some(model) = read_pointer(&process, part + PART_PARENT_MODEL_OFFSET) else {
+                continue;
+            };
+            if model == 0 || read_pointer(&process, model) != Some(model_vtable) {
+                continue;
+            }
+            if let Some(name) = read_instance_name(&process, model) {
+                roots[root_index].part = Some(part);
+                roots[root_index].model = Some(model);
+                roots[root_index].name = Some(name);
+                break;
+            }
         }
+    }
+
+    let named_players: Vec<(usize, String)> = players
+        .iter()
+        .filter_map(|player| read_instance_name(&process, *player).map(|name| (*player, name)))
+        .collect();
+    let mut player_names: Vec<String> =
+        named_players.iter().map(|(_, name)| name.clone()).collect();
+    player_names.sort();
+    player_names.dedup();
+    let local_roots: Vec<usize> = roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| {
+            root.name
+                .as_ref()
+                .filter(|candidate| player_names.iter().any(|player| player == *candidate))
+                .map(|_| index)
+        })
+        .collect();
+    if local_roots.len() != 1 {
+        let root_names = roots
+            .iter()
+            .map(|root| root.name.as_deref().unwrap_or("<unknown>"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Expected exactly one Humanoid root whose Model name matches a Player name; found {} (Humanoids: {}, Players: {}, player names: [{}], root models: [{}])",
+            local_roots.len(),
+            humanoids.len(),
+            players.len(),
+            player_names.join(", "),
+            root_names
+        ));
+    }
+    let local_index = local_roots[0];
+    let local_name = roots[local_index].name.as_deref().unwrap();
+    let local_players: Vec<usize> = named_players
+        .iter()
+        .filter_map(|(player, name)| (name == local_name).then_some(*player))
+        .collect();
+    if local_players.len() != 1 {
+        return Err(format!(
+            "Expected exactly one Player instance named {local_name}; found {}",
+            local_players.len()
+        ));
+    }
+    let target = ResolvedLocalPlayer {
+        pid,
+        process,
+        username: local_name.to_string(),
+        // No UserId offset has been independently validated for this client build.
+        user_id: None,
+        humanoid: roots[local_index].humanoid,
+        primitive: roots[local_index].primitive,
+        part: roots[local_index].part.unwrap(),
+        model: roots[local_index].model.unwrap(),
+        player: local_players[0],
+        humanoid_vtable,
+        primitive_vtable,
+        part_vtable,
+        model_vtable,
+        player_vtable,
+    };
+    Ok(DiscoveryResult {
+        target,
+        module_base,
+        humanoid_count: humanoids.len(),
+        player_count: players.len(),
+        player_names,
+        read_failures: first_read_failures + second_read_failures,
+        roots,
+    })
+}
+
+fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
+    let discovery = discover_local_player(pid)?;
+    println!("Roblox PID: {pid}");
+    println!("Validated module base: 0x{:016x}", discovery.module_base);
+    println!("Humanoid RTTI hits: {}", discovery.humanoid_count);
+    println!("Player RTTI hits: {}", discovery.player_count);
+    println!(
+        "Player names: {}",
+        if discovery.player_names.is_empty() {
+            "<none>".to_string()
+        } else {
+            discovery.player_names.join(", ")
+        }
+    );
+    println!("Read failures: {}", discovery.read_failures);
+    println!(
+        "Validated Humanoid root Primitives: {}",
+        discovery.roots.len()
+    );
+    for (index, root) in discovery.roots.iter().enumerate() {
+        println!(
+            "Root {}: model={} humanoid=0x{:016x} primitive=0x{:016x} X={} Y={} Z={}",
+            index + 1,
+            root.name.as_deref().unwrap_or("<unknown>"),
+            root.humanoid,
+            root.primitive,
+            root.position[0],
+            root.position[1],
+            root.position[2]
+        );
+    }
+    let position = poll_position(&discovery.target).map_err(|error| match error {
+        PollError::TargetInvalid(message) => message,
+        PollError::PositionCopiesDisagree => "Position copies disagree".to_string(),
+    })?;
+    println!();
+    println!("Local player: {}", discovery.target.username);
+    println!("X: {}", position[0]);
+    println!("Y: {}", position[1]);
+    println!("Z: {}", position[2]);
+    Ok(())
+}
+
+fn validate_target(target: &ResolvedLocalPlayer, validate_names: bool) -> Result<(), String> {
+    let process = &target.process;
+    let checks = [
+        (
+            read_pointer(process, target.humanoid),
+            target.humanoid_vtable,
+            "Humanoid vtable",
+        ),
+        (
+            read_pointer(process, target.humanoid + HUMANOID_ROOT_PRIMITIVE_OFFSET),
+            target.primitive,
+            "Humanoid root Primitive",
+        ),
+        (
+            read_pointer(process, target.primitive),
+            target.primitive_vtable,
+            "Primitive vtable",
+        ),
+        (
+            read_pointer(process, target.part + PART_SUBOBJECT_OFFSET),
+            target.part_vtable,
+            "Part vtable",
+        ),
+        (
+            read_pointer(process, target.part + PART_PRIMITIVE_FIELD_OFFSET),
+            target.primitive,
+            "Part Primitive",
+        ),
+        (
+            read_pointer(process, target.part + PART_PARENT_MODEL_OFFSET),
+            target.model,
+            "Part parent Model",
+        ),
+        (
+            read_pointer(process, target.model),
+            target.model_vtable,
+            "Model vtable",
+        ),
+        (
+            read_pointer(process, target.player),
+            target.player_vtable,
+            "Player vtable",
+        ),
+    ];
+    for (actual, expected, label) in checks {
+        if actual != Some(expected) {
+            return Err(format!("{label} validation failed"));
+        }
+    }
+    if validate_names {
+        if read_instance_name(process, target.model).as_deref() != Some(&target.username) {
+            return Err("Character Model name validation failed".to_string());
+        }
+        if read_instance_name(process, target.player).as_deref() != Some(&target.username) {
+            return Err("Player name validation failed".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn poll_position(target: &ResolvedLocalPlayer) -> Result<[f32; 3], PollError> {
+    validate_target(target, false).map_err(PollError::TargetInvalid)?;
+    let position = read_agreed_position(&target.process, target.primitive)?;
+    validate_target(target, false).map_err(PollError::TargetInvalid)?;
+    Ok(position)
+}
+
+fn read_agreed_position(process: &ProcessHandle, primitive: usize) -> Result<[f32; 3], PollError> {
+    let mut saw_disagreement = false;
+    for _ in 0..3 {
         let mut first_bytes = [0u8; 12];
         let mut copy_bytes = [0u8; 12];
         if !read_exact(
-            &process,
+            process,
             primitive + PRIMITIVE_POSITION_OFFSET,
             &mut first_bytes,
         ) || !read_exact(
-            &process,
+            process,
             primitive + PRIMITIVE_POSITION_COPY_OFFSET,
             &mut copy_bytes,
         ) {
-            continue;
+            return Err(PollError::TargetInvalid(
+                "Position memory became unreadable".to_string(),
+            ));
         }
         if first_bytes != copy_bytes {
+            saw_disagreement = true;
             continue;
         }
         let position = [
@@ -1216,105 +1515,185 @@ fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
             read_f32(&first_bytes, 4),
             read_f32(&first_bytes, 8),
         ];
-        if position_is_plausible(&position) {
-            roots.push((humanoid, primitive, position));
+        if !position_is_valid(&position) {
+            return Err(PollError::TargetInvalid(
+                "Position values are not finite world coordinates".to_string(),
+            ));
         }
+        return Ok(position);
     }
+    debug_assert!(saw_disagreement);
+    Err(PollError::PositionCopiesDisagree)
+}
 
-    let primitive_targets: Vec<usize> = roots.iter().map(|root| root.1).collect();
-    let (primitive_references, second_read_failures) =
-        scan_private_writable_targets(&process, &primitive_targets);
-    let mut root_names = vec![None; roots.len()];
-    for (root_index, references) in primitive_references.iter().enumerate() {
-        for pointer_address in references {
-            let Some(part) = pointer_address.checked_sub(PART_PRIMITIVE_FIELD_OFFSET) else {
-                continue;
+fn valid_telemetry(target: &ResolvedLocalPlayer, position: [f32; 3]) -> Telemetry {
+    Telemetry {
+        username: Some(target.username.clone()),
+        user_id: target.user_id,
+        x: Some(position[0]),
+        y: Some(position[1]),
+        z: Some(position[2]),
+        sample_timestamp: Some(SystemTime::now()),
+        validity: TelemetryValidity::Valid,
+    }
+}
+
+fn unavailable_telemetry(
+    target: Option<&ResolvedLocalPlayer>,
+    reason: TelemetryUnavailableReason,
+) -> Telemetry {
+    Telemetry {
+        username: target.map(|value| value.username.clone()),
+        user_id: target.and_then(|value| value.user_id),
+        x: None,
+        y: None,
+        z: None,
+        sample_timestamp: None,
+        validity: TelemetryValidity::Unavailable(reason),
+    }
+}
+
+fn render_telemetry(telemetry: &Telemetry) {
+    let line = match &telemetry.validity {
+        TelemetryValidity::Valid => format!(
+            "Local player: {} | X: {} | Y: {} | Z: {}",
+            telemetry.username.as_deref().unwrap_or("<unknown>"),
+            telemetry.x.unwrap(),
+            telemetry.y.unwrap(),
+            telemetry.z.unwrap()
+        ),
+        TelemetryValidity::Unavailable(reason) => {
+            let detail = match reason {
+                TelemetryUnavailableReason::Discovering => "discovering".to_string(),
+                TelemetryUnavailableReason::RobloxUnavailable(message)
+                | TelemetryUnavailableReason::DiscoveryFailed(message)
+                | TelemetryUnavailableReason::TargetInvalid(message) => message.clone(),
+                TelemetryUnavailableReason::PositionCopiesDisagree => {
+                    "position copies disagree".to_string()
+                }
             };
-            let mut pointer_bytes = [0u8; 8];
-            if !read_exact(&process, part + PART_SUBOBJECT_OFFSET, &mut pointer_bytes)
-                || read_u64(&pointer_bytes, 0) as usize != part_vtable
+            format!("Telemetry unavailable: {detail}")
+        }
+    };
+    print!("\r\x1b[2K{line}");
+    let _ = std::io::stdout().flush();
+}
+
+fn parse_poll_rate(args: &[String]) -> Result<f64, String> {
+    let Some(raw) = arg_value(args, "--hz") else {
+        return Ok(20.0);
+    };
+    let hz = raw
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid --hz value: {raw}"))?;
+    if !hz.is_finite() || !(1.0..=240.0).contains(&hz) {
+        return Err("--hz must be between 1 and 240".to_string());
+    }
+    Ok(hz)
+}
+
+fn stream_telemetry(args: &[String]) -> Result<(), String> {
+    let interval = Duration::from_secs_f64(1.0 / parse_poll_rate(args)?);
+    let retry_delay = Duration::from_secs(1);
+    let identity_interval = Duration::from_secs(1);
+    let mut target: Option<ResolvedLocalPlayer> = None;
+    let mut next_identity_check = Instant::now();
+    let mut next_tick = Instant::now();
+    let mut consecutive_copy_disagreements = 0u32;
+
+    loop {
+        if target.is_none() {
+            render_telemetry(&unavailable_telemetry(
+                None,
+                TelemetryUnavailableReason::Discovering,
+            ));
+            let pid = match requested_pid(&[]) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    render_telemetry(&unavailable_telemetry(
+                        None,
+                        TelemetryUnavailableReason::RobloxUnavailable(error),
+                    ));
+                    thread::sleep(retry_delay);
+                    continue;
+                }
+            };
+            match discover_local_player(pid) {
+                Ok(discovery) => {
+                    target = Some(discovery.target);
+                    next_identity_check = Instant::now();
+                    next_tick = Instant::now();
+                    consecutive_copy_disagreements = 0;
+                }
+                Err(error) => {
+                    render_telemetry(&unavailable_telemetry(
+                        None,
+                        TelemetryUnavailableReason::DiscoveryFailed(error),
+                    ));
+                    thread::sleep(retry_delay);
+                    continue;
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now < next_tick {
+            thread::sleep(next_tick - now);
+        }
+        next_tick += interval;
+        if next_tick < Instant::now() {
+            next_tick = Instant::now() + interval;
+        }
+
+        let mut invalidate_reason = None;
+        if Instant::now() >= next_identity_check {
+            let current_pid = requested_pid(&[]);
+            if current_pid.as_ref().ok() != target.as_ref().map(|value| &value.pid) {
+                invalidate_reason = Some(match current_pid {
+                    Ok(pid) => format!("Roblox process changed to PID {pid}"),
+                    Err(error) => error,
+                });
+            } else if let Some(current) = target.as_ref()
+                && let Err(error) = validate_target(current, true)
             {
-                continue;
+                invalidate_reason = Some(error);
             }
-            if !read_exact(
-                &process,
-                part + PART_PARENT_MODEL_OFFSET,
-                &mut pointer_bytes,
-            ) {
-                continue;
+            next_identity_check = Instant::now() + identity_interval;
+        }
+        if let Some(reason) = invalidate_reason {
+            render_telemetry(&unavailable_telemetry(
+                target.as_ref(),
+                TelemetryUnavailableReason::TargetInvalid(reason),
+            ));
+            target = None;
+            continue;
+        }
+
+        let current = target.as_ref().unwrap();
+        match poll_position(current) {
+            Ok(position) => {
+                consecutive_copy_disagreements = 0;
+                render_telemetry(&valid_telemetry(current, position));
             }
-            let model = read_u64(&pointer_bytes, 0) as usize;
-            if model == 0 || !read_exact(&process, model, &mut pointer_bytes) {
-                continue;
+            Err(PollError::PositionCopiesDisagree) => {
+                consecutive_copy_disagreements += 1;
+                render_telemetry(&unavailable_telemetry(
+                    Some(current),
+                    TelemetryUnavailableReason::PositionCopiesDisagree,
+                ));
+                if consecutive_copy_disagreements >= 5 {
+                    target = None;
+                }
             }
-            if read_u64(&pointer_bytes, 0) as usize != model_vtable {
-                continue;
-            }
-            if let Some(name) = read_instance_name(&process, model) {
-                root_names[root_index] = Some(name);
-                break;
+            Err(PollError::TargetInvalid(error)) => {
+                render_telemetry(&unavailable_telemetry(
+                    Some(current),
+                    TelemetryUnavailableReason::TargetInvalid(error),
+                ));
+                target = None;
             }
         }
     }
-
-    let mut player_names: Vec<String> = players
-        .iter()
-        .filter_map(|player| read_instance_name(&process, *player))
-        .collect();
-    player_names.sort();
-    player_names.dedup();
-    let local_roots: Vec<usize> = root_names
-        .iter()
-        .enumerate()
-        .filter_map(|(index, name)| {
-            name.as_ref()
-                .filter(|candidate| player_names.iter().any(|player| player == *candidate))
-                .map(|_| index)
-        })
-        .collect();
-
-    println!("Roblox PID: {pid}");
-    println!("Validated module base: 0x{module_base:016x}");
-    println!("Humanoid RTTI hits: {}", humanoids.len());
-    println!("Player RTTI hits: {}", players.len());
-    println!(
-        "Player names: {}",
-        if player_names.is_empty() {
-            "<none>".to_string()
-        } else {
-            player_names.join(", ")
-        }
-    );
-    println!(
-        "Read failures: {}",
-        first_read_failures + second_read_failures
-    );
-    println!("Validated Humanoid root Primitives: {}", roots.len());
-    for (index, (humanoid, primitive, position)) in roots.iter().enumerate() {
-        println!(
-            "Root {}: model={} humanoid=0x{humanoid:016x} primitive=0x{primitive:016x} X={} Y={} Z={}",
-            index + 1,
-            root_names[index].as_deref().unwrap_or("<unknown>"),
-            position[0],
-            position[1],
-            position[2]
-        );
-    }
-    if local_roots.len() != 1 {
-        return Err(format!(
-            "Expected exactly one Humanoid root whose Model name matches a Player name; found {}",
-            local_roots.len()
-        ));
-    }
-    let local_index = local_roots[0];
-    let local_name = root_names[local_index].as_deref().unwrap();
-    let position = roots[local_index].2;
-    println!();
-    println!("Local player: {local_name}");
-    println!("X: {}", position[0]);
-    println!("Y: {}", position[1]);
-    println!("Z: {}", position[2]);
-    Ok(())
 }
 
 fn compare_cframes(pid: u32, input: PathBuf, output: PathBuf) -> Result<(), String> {
@@ -1438,6 +1817,9 @@ fn run() -> Result<(), String> {
     let Some(command) = args.get(1).map(String::as_str) else {
         usage();
     };
+    if command == "stream-telemetry" {
+        return stream_telemetry(&args);
+    }
     let pid = requested_pid(&args)?;
     match command {
         "survey" => survey(pid),
@@ -1542,5 +1924,56 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("ERROR: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn poll_rate_defaults_to_twenty_hz() {
+        assert_eq!(parse_poll_rate(&[]).unwrap(), 20.0);
+    }
+
+    #[test]
+    fn poll_rate_accepts_supported_limits() {
+        assert_eq!(
+            parse_poll_rate(&arguments(&["stream-telemetry", "--hz", "1"])).unwrap(),
+            1.0
+        );
+        assert_eq!(
+            parse_poll_rate(&arguments(&["stream-telemetry", "--hz", "240"])).unwrap(),
+            240.0
+        );
+    }
+
+    #[test]
+    fn poll_rate_rejects_unsupported_values() {
+        for value in ["0", "241", "NaN", "not-a-number"] {
+            assert!(parse_poll_rate(&arguments(&["stream-telemetry", "--hz", value])).is_err());
+        }
+    }
+
+    #[test]
+    fn unavailable_telemetry_never_contains_coordinates_or_timestamp() {
+        let telemetry = unavailable_telemetry(
+            None,
+            TelemetryUnavailableReason::RobloxUnavailable("not running".to_string()),
+        );
+        assert!(telemetry.username.is_none());
+        assert!(telemetry.user_id.is_none());
+        assert!(telemetry.x.is_none());
+        assert!(telemetry.y.is_none());
+        assert!(telemetry.z.is_none());
+        assert!(telemetry.sample_timestamp.is_none());
+        assert!(matches!(
+            telemetry.validity,
+            TelemetryValidity::Unavailable(_)
+        ));
     }
 }
