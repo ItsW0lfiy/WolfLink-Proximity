@@ -284,7 +284,9 @@ fn start_room(
         }
         match first_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(first)) if first.starts_with("WolfLink relay listening on ") => {
-                let _ = events.send(Event::Line(first.trim().to_string()));
+                let _ = events.send(Event::Line(
+                    "Relay listening on verified Tailnet interface".into(),
+                ));
             }
             _ => {
                 let _ = child.kill();
@@ -354,7 +356,7 @@ fn worker(actions: Receiver<Action>, events: Sender<Event>) {
         if last_tailnet.elapsed() >= Duration::from_secs(5) {
             let result = status_json()
                 .and_then(|json| parse_local_status(&json))
-                .map(|device| format!("Connected ({})", device.address));
+                .map(|_| "Connected".to_string());
             let _ = events.send(Event::Tailnet(result));
             let _ = events.send(Event::Roblox(roblox_running()));
             last_tailnet = Instant::now();
