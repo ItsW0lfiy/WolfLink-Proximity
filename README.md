@@ -1,8 +1,20 @@
 # WolfLink Proximity
 
-WolfLink is an in-progress Discord-powered proximity-voice client. The Roblox reader discovers the running process, identifies the local player's character, and reads its world position without modifying or controlling Roblox. The Discord voice bridge and authenticated telemetry relay are separate components; see [voice/README.md](voice/README.md), [relay/README.md](relay/README.md), the [local P2P probe](p2p-probe/README.md), and the [networking design/status](NETWORKING.md).
+## Friends-only Windows build (experimental)
 
-The relay and attenuation logic have automated tests. The Windows voice bridge has been built against Discord Social SDK 1.10.19337. Two different users on two Windows PCs authenticated, joined the same call, and heard speech in both directions; changing the laptop participant's local volume from 100 to 0 and back audibly silenced and restored it on the PC. The combined clients also passed a live simulated-position test through a temporary `wss://` tunnel: speech was audible at 0 studs, quieter at 30, muted at 100, muted when telemetry became unavailable, and restored when valid coordinates returned. A stable hosted relay and independently verified Roblox game-session identity are still needed before production Roblox-derived proximity can be claimed.
+`WolfLink.exe` is now a native Windows frontend. It starts and supervises the read-only Roblox reader, authenticated telemetry client, Discord Social SDK voice bridge, and (for hosts) Tailnet-bound relay. No developer terminal is needed after packaging. The development build is in `dist/WolfLink-0.1.0-dev/WolfLink.exe`; it is not a public release.
+
+For a private test, both people install and sign in to Tailscale and ensure the two devices are permitted to communicate through Tailscale device sharing or Tailnet access rules. Both install Discord desktop, then run the same WolfLink development bundle. The host selects **Experimental private room**, enters their exact Roblox username, acknowledges that the Roblox server is unverified, clicks **Create Room**, and privately sends the copied invitation. The friend enters their own exact username, acknowledges the same limitation, pastes the invitation, and clicks **Join Room**. Both approve the Discord prompt. The host PC must stay online. Roblox telemetry and voice remain unavailable or muted when the memory layout, local-player identity, position copies, Tailnet peer identity, or relay session cannot be validated. No firewall rules are changed by WolfLink; Windows may ask the host to allow the app's Tailnet-bound listener.
+
+The default non-experimental room uses simulated XYZ only. A regular production Roblox room remains disabled until a trustworthy Roblox server-instance identifier can be read. Direct P2P, spatial audio, audio-device selection, and production signed updates are not part of this build. Discord tokens are not written to preferences; the room invitation is a short-lived secret and should be shared only with trusted friends.
+
+The Roblox client running on 2026-10-11 did not match the reader's validated RTTI layout, and a read-only scan found none of the five expected class type descriptors in its mapped images. On that build, experimental real-Roblox telemetry remains **unavailable** and proximity audio stays muted. Do not treat the development bundle as a verified Roblox-proximity build until the reader is revalidated against a compatible client.
+
+Developers can build the local bundle with `cargo build --release --workspace --locked --offline`, the configured `voice/build` CMake Release target, then `scripts/package-dev.ps1`. The script copies required Discord SDK files, notices, and the app-local Visual C++ runtime files from the installed Build Tools without committing them. Microsoft permits app-local copying of files in the Visual Studio VC redist folder subject to its license terms ([redistribution guidance](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)).
+
+WolfLink is an in-progress Discord-powered proximity-voice client. The Roblox reader discovers the running process, identifies the local player's character, and reads its world position without modifying or controlling Roblox. The native frontend now manages the Discord voice bridge and authenticated telemetry relay as bundled components; see [voice/README.md](voice/README.md), [relay/README.md](relay/README.md), the [local P2P probe](p2p-probe/README.md), and the [networking design/status](NETWORKING.md).
+
+The relay and attenuation logic have automated tests. The Windows voice bridge has been built against Discord Social SDK 1.10.19337. Two different users on two Windows PCs authenticated, joined the same call, and heard speech in both directions; changing the laptop participant's local volume from 100 to 0 and back audibly silenced and restored it on the PC. The combined clients also passed a live simulated-position test through a temporary `wss://` tunnel: speech was audible at 0 studs, quieter at 30, muted at 100, muted when telemetry became unavailable, and restored when valid coordinates returned. A Tailnet-bound host relay is now implemented and passed a local bind test, but this new transport has not been verified between two PCs. Independently verified Roblox game-session identity is still unavailable.
 
 ## Run
 
@@ -15,7 +27,7 @@ One validated sample:
 Expected output:
 
 ```text
-Local player: orwell213
+Local player: example_user
 X: -6.92462
 Y: 8.97397
 Z: -4.055195
@@ -51,7 +63,7 @@ The locator:
 5. Resolves the Primitive's owning `RBX::Part`, then the parent `RBX::ModelInstance` and its name.
 6. Selects the one character Model whose name matches an `RBX::Player` name.
 
-This correctly rejects the current game's additional stationary Humanoid named `Player` and selects the character Model named `orwell213`.
+In the previously validated single-player game, this rejected an additional stationary Humanoid named `Player` and selected the local character Model by its matching Player name.
 
 After discovery, continuous mode caches the validated Player, character Model, Humanoid, Part, and Primitive addresses. Normal samples only perform small pointer/identity reads and read the Primitive's two 12-byte position copies. A position is published only when both copies agree exactly and all coordinates are finite and within the accepted world range.
 

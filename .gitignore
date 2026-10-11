@@ -1,4 +1,5 @@
 /target/
+/dist/
 /captures/
 /voice/build/
 /dependancies/

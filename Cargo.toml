@@ -8,5 +8,5 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = ["relay", "p2p-probe"]
+members = ["relay", "p2p-probe", "app"]
 

@@ -678,9 +678,9 @@ mod tests {
     #[test]
     fn reader_lines_require_valid_position() {
         let now = Instant::now();
-        assert!(parse_reader_line("POS orwell213 1 2 3", now).is_some());
+        assert!(parse_reader_line("POS example_user 1 2 3", now).is_some());
         assert!(parse_reader_line("UNAVAILABLE", now).is_none());
-        assert!(parse_reader_line("POS orwell213 NaN 2 3", now).is_none());
+        assert!(parse_reader_line("POS example_user NaN 2 3", now).is_none());
         assert!(parse_reader_line("POS <unknown> 1 2 3", now).is_none());
         assert!(parse_reader_line("Local player: x", now).is_none());
     }
