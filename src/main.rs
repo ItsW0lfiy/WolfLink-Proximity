@@ -29,8 +29,8 @@ const PAGE_GUARD: u32 = 0x100;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const CFRAME_BYTES: usize = 12 * 4;
 
-// Current-client layout. Every RVA is validated against MSVC RTTI before use,
-// and every position is required to match the Primitive's duplicate copy.
+// Previously validated layout. Every RVA must match MSVC RTTI before any
+// object or position offset is used; incompatible clients fail closed.
 const HUMANOID_VTABLE_RVA: usize = 0x06cb_c560;
 const PRIMITIVE_VTABLE_RVA: usize = 0x06ca_6f68;
 const PART_VTABLE_RVA: usize = 0x06c2_98b0;
@@ -43,6 +43,13 @@ const PART_SUBOBJECT_OFFSET: usize = 0x148;
 const PART_PRIMITIVE_FIELD_OFFSET: usize = 0x178;
 const PART_PARENT_MODEL_OFFSET: usize = 0x68;
 const INSTANCE_NAME_OFFSET: usize = 0x70;
+const EXPECTED_RTTI: [(usize, &str); 5] = [
+    (HUMANOID_VTABLE_RVA, ".?AVHumanoid@RBX@@"),
+    (PRIMITIVE_VTABLE_RVA, ".?AVPrimitive@RBX@@"),
+    (PART_VTABLE_RVA, ".?AVPart@RBX@@"),
+    (MODEL_VTABLE_RVA, ".?AVModelInstance@RBX@@"),
+    (PLAYER_VTABLE_RVA, ".?AVPlayer@RBX@@"),
+];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -213,6 +220,7 @@ fn usage() -> ! {
         "  roblox-memory-scanner inspect-object-pointers --address ADDRESS [--bytes N] [--pid PID]"
     );
     eprintln!("  roblox-memory-scanner locate-humanoid-roots [--pid PID]");
+    eprintln!("  roblox-memory-scanner diagnose-layout [--pid PID]");
     eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ]");
     eprintln!(
         "  roblox-memory-scanner stream-telemetry [--hz HZ] [--machine] [--username OWN_USERNAME]"
@@ -1235,15 +1243,7 @@ fn discover_local_player(
     let process = open_read_only(pid)?;
     let modules = image_modules(&process);
     let module = modules.into_iter().find(|(base, size)| {
-        [
-            (HUMANOID_VTABLE_RVA, ".?AVHumanoid@RBX@@"),
-            (PRIMITIVE_VTABLE_RVA, ".?AVPrimitive@RBX@@"),
-            (PART_VTABLE_RVA, ".?AVPart@RBX@@"),
-            (MODEL_VTABLE_RVA, ".?AVModelInstance@RBX@@"),
-            (PLAYER_VTABLE_RVA, ".?AVPlayer@RBX@@"),
-        ]
-        .iter()
-        .all(|(rva, expected)| {
+        EXPECTED_RTTI.iter().all(|(rva, expected)| {
             rtti_type_name(&process, *base, *size, base.saturating_add(*rva)).as_deref()
                 == Some(*expected)
         })
@@ -1383,6 +1383,25 @@ fn discover_local_player(
         read_failures: first_read_failures + second_read_failures,
         roots,
     })
+}
+
+fn diagnose_layout(pid: u32) -> Result<(), String> {
+    let process = open_read_only(pid)?;
+    let mut modules = image_modules(&process);
+    modules.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    println!("Roblox PID: {pid}");
+    println!("Readable PE images: {}", modules.len());
+    for (base, size) in modules.into_iter().take(5) {
+        println!("Image base: 0x{base:016x}; size: 0x{size:x}");
+        for (rva, expected) in EXPECTED_RTTI {
+            let actual = rtti_type_name(&process, base, size, base.saturating_add(rva));
+            println!(
+                "  {expected} at RVA 0x{rva:x}: {}",
+                actual.as_deref().unwrap_or("<no valid RTTI>")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
@@ -1870,6 +1889,7 @@ fn run() -> Result<(), String> {
     }
     let pid = requested_pid(&args)?;
     match command {
+        "diagnose-layout" => diagnose_layout(pid),
         "survey" => survey(pid),
         "capture-cframes" => {
             let output = arg_value(&args, "--out")

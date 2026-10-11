@@ -178,7 +178,7 @@ impl Ui {
         unsafe {
             label(
                 hwnd,
-                "WolfLink Proximity 0.1.0 — experimental build",
+                "WolfLink Proximity 0.1.0-alpha.1 — private pre-release",
                 20,
                 15,
                 700,
@@ -329,7 +329,7 @@ impl Ui {
                 28,
                 ID_VOLUME_SET,
             );
-            let roblox_state = label(hwnd, "Roblox telemetry: unavailable", 20, 381, 720);
+            let roblox_state = label(hwnd, "Telemetry: unavailable", 20, 381, 720);
             label(
                 hwnd,
                 "Fixed range: 60 studs. Invalid/stale telemetry mutes audio.",
@@ -477,15 +477,16 @@ impl Ui {
                     &format!("Tailscale: {}", result.unwrap_or_else(|error| error)),
                 ),
                 Event::Roblox(running) => {
-                    if !self.telemetry_valid
+                    if (!self.connected || self.room_mode == RoomMode::ExperimentalRoblox)
+                        && !self.telemetry_valid
                         && !text(self.roblox_state).starts_with("Roblox discovery failed:")
                     {
                         set_text(
                             self.roblox_state,
                             if running {
-                                "Roblox: detected · telemetry unavailable"
+                                "Real Roblox telemetry: unavailable (Roblox detected)"
                             } else {
-                                "Roblox: not detected · telemetry unavailable"
+                                "Real Roblox telemetry: unavailable (Roblox not detected)"
                             },
                         );
                     }
@@ -499,10 +500,16 @@ impl Ui {
                     self.hosting = host;
                     self.connected = true;
                     self.room_mode = mode;
+                    self.telemetry_valid = false;
                     if mode == RoomMode::ExperimentalRoblox {
                         set_text(
                             self.roblox_state,
-                            "Roblox telemetry: discovering local player",
+                            "Real Roblox telemetry: discovering local player",
+                        );
+                    } else {
+                        set_text(
+                            self.roblox_state,
+                            "Simulated telemetry: unavailable; set XYZ",
                         );
                     }
                     unsafe {
@@ -529,7 +536,9 @@ impl Ui {
                 Event::Stopped => {
                     self.connected = false;
                     self.hosting = false;
+                    self.telemetry_valid = false;
                     self.participants.clear();
+                    set_text(self.roblox_state, "Telemetry: unavailable (no room)");
                     if text(self.status).starts_with("Leaving room") {
                         set_text(self.status, "Not connected");
                     }
@@ -551,14 +560,14 @@ impl Ui {
                         set_text(
                             self.roblox_state,
                             &format!(
-                                "Roblox telemetry: valid for {name} (Unverified Roblox Server)"
+                                "Real Roblox telemetry: valid for {name} (Unverified Roblox Server)"
                             ),
                         );
                     } else if line.contains("Roblox telemetry unavailable") {
                         self.telemetry_valid = false;
                         set_text(
                             self.roblox_state,
-                            "Roblox telemetry: unavailable; voice fails closed",
+                            "Real Roblox telemetry: unavailable; voice fails closed",
                         );
                     } else if let Some(reason) =
                         line.strip_prefix("WolfLink: Roblox reader: Roblox discovery failed: ")
@@ -643,22 +652,27 @@ impl Ui {
                     self.record("Loudness must be 50–150%".into());
                 }
             }
-            ID_POSITION if self.room_mode == RoomMode::Simulated => {
+            ID_POSITION if self.connected && self.room_mode == RoomMode::Simulated => {
                 let values = self.positions.map(text);
-                if values
-                    .iter()
-                    .all(|v| v.parse::<f32>().is_ok_and(f32::is_finite))
-                {
+                if values.iter().all(|v| {
+                    v.parse::<f32>()
+                        .is_ok_and(|n| n.is_finite() && n.abs() <= 1_000_000.0)
+                }) {
                     let _ = self.actions.send(Action::Control(format!(
                         "position {} {} {}",
                         values[0], values[1], values[2]
                     )));
+                    set_text(self.roblox_state, "Simulated telemetry: position submitted");
                 } else {
                     self.record("Invalid simulated coordinates".into());
                 }
             }
-            ID_UNAVAILABLE if self.room_mode == RoomMode::Simulated => {
+            ID_UNAVAILABLE if self.connected && self.room_mode == RoomMode::Simulated => {
                 let _ = self.actions.send(Action::Control("unavailable".into()));
+                set_text(
+                    self.roblox_state,
+                    "Simulated telemetry: unavailable; voice fails closed",
+                );
             }
             _ => {}
         }
