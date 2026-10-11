@@ -247,4 +247,31 @@ mod tests {
             0.0
         );
     }
+
+    #[test]
+    fn rooms_support_three_ten_and_twenty_five_participants_with_cleanup() {
+        for count in [3, 10, 25] {
+            let mut rooms = Rooms::default();
+            let primary = RoomKey::new("room-one-abcdefghijkl", "private-session").unwrap();
+            let isolated = RoomKey::new("room-two-abcdefghijkl", "private-session").unwrap();
+            let now = Instant::now();
+            for id in 1..=count {
+                let user = id.to_string();
+                assert!(rooms.join(primary.clone(), user.clone(), id));
+                assert!(rooms.update(&primary, &user, id, Some(position(id as f32)), now));
+            }
+            assert!(rooms.join(isolated.clone(), "999".into(), 999));
+            assert_eq!(rooms.snapshot(&primary, "1", now).len(), count as usize - 1);
+            assert!(rooms.snapshot(&isolated, "999", now).is_empty());
+            rooms.leave(&primary, "2", 9999);
+            assert_eq!(rooms.snapshot(&primary, "1", now).len(), count as usize - 1);
+            rooms.leave(&primary, "2", 2);
+            assert_eq!(rooms.snapshot(&primary, "1", now).len(), count as usize - 2);
+            assert!(
+                rooms
+                    .snapshot(&primary, "1", now + Duration::from_millis(501))
+                    .is_empty()
+            );
+        }
+    }
 }

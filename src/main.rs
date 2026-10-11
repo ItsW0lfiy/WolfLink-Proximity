@@ -214,7 +214,9 @@ fn usage() -> ! {
     );
     eprintln!("  roblox-memory-scanner locate-humanoid-roots [--pid PID]");
     eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ]");
-    eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ] [--machine]");
+    eprintln!(
+        "  roblox-memory-scanner stream-telemetry [--hz HZ] [--machine] [--username OWN_USERNAME]"
+    );
     std::process::exit(2);
 }
 
@@ -1226,7 +1228,10 @@ fn read_pointer(process: &ProcessHandle, address: usize) -> Option<usize> {
     read_exact(process, address, &mut bytes).then(|| read_u64(&bytes, 0) as usize)
 }
 
-fn discover_local_player(pid: u32) -> Result<DiscoveryResult, String> {
+fn discover_local_player(
+    pid: u32,
+    expected_username: Option<&str>,
+) -> Result<DiscoveryResult, String> {
     let process = open_read_only(pid)?;
     let modules = image_modules(&process);
     let module = modules.into_iter().find(|(base, size)| {
@@ -1321,6 +1326,7 @@ fn discover_local_player(pid: u32) -> Result<DiscoveryResult, String> {
             root.name
                 .as_ref()
                 .filter(|candidate| player_names.iter().any(|player| player == *candidate))
+                .filter(|candidate| expected_username.is_none_or(|expected| *candidate == expected))
                 .map(|_| index)
         })
         .collect();
@@ -1380,7 +1386,7 @@ fn discover_local_player(pid: u32) -> Result<DiscoveryResult, String> {
 }
 
 fn locate_humanoid_roots(pid: u32) -> Result<(), String> {
-    let discovery = discover_local_player(pid)?;
+    let discovery = discover_local_player(pid, None)?;
     println!("Roblox PID: {pid}");
     println!("Validated module base: 0x{:016x}", discovery.module_base);
     println!("Humanoid RTTI hits: {}", discovery.humanoid_count);
@@ -1558,7 +1564,8 @@ fn render_telemetry(telemetry: &Telemetry, machine: bool) {
     if machine {
         match &telemetry.validity {
             TelemetryValidity::Valid => println!(
-                "POS {} {} {}",
+                "POS {} {} {} {}",
+                telemetry.username.as_deref().unwrap_or("<unknown>"),
                 telemetry.x.unwrap(),
                 telemetry.y.unwrap(),
                 telemetry.z.unwrap()
@@ -1608,6 +1615,14 @@ fn parse_poll_rate(args: &[String]) -> Result<f64, String> {
 
 fn stream_telemetry(args: &[String]) -> Result<(), String> {
     let machine = args.iter().any(|arg| arg == "--machine");
+    let expected_username = arg_value(args, "--username");
+    if let Some(name) = &expected_username
+        && (name.is_empty()
+            || name.len() > 64
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    {
+        return Err("--username must be an exact Roblox username containing only letters, digits, or underscores".into());
+    }
     let interval = Duration::from_secs_f64(1.0 / parse_poll_rate(args)?);
     let retry_delay = Duration::from_secs(1);
     let identity_interval = Duration::from_secs(1);
@@ -1636,7 +1651,7 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
                     continue;
                 }
             };
-            match discover_local_player(pid) {
+            match discover_local_player(pid, expected_username.as_deref()) {
                 Ok(discovery) => {
                     target = Some(discovery.target);
                     next_identity_check = Instant::now();

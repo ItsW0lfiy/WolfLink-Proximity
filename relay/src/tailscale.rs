@@ -1,8 +1,11 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -93,14 +96,43 @@ fn tailscale_exe() -> Result<PathBuf, String> {
 }
 
 pub fn status_json() -> Result<String, String> {
-    let output = Command::new(tailscale_exe()?)
+    let mut child = Command::new(tailscale_exe()?)
+        .creation_flags(0x0800_0000)
         .args(["status", "--json"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| format!("Tailscale status failed: {error}"))?;
-    if !output.status.success() || output.stdout.len() > 2_000_000 {
+    let mut stdout = child.stdout.take().ok_or("Tailscale output unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .by_ref()
+            .take(2_000_001)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("Tailscale status timed out or failed".into());
+            }
+        }
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| "Tailscale output reader failed")?
+        .map_err(|_| "Tailscale output read failed")?;
+    if !status.success() || bytes.len() > 2_000_000 {
         return Err("Tailscale status is unavailable or too large".into());
     }
-    String::from_utf8(output.stdout).map_err(|_| "Invalid Tailscale status encoding".into())
+    String::from_utf8(bytes).map_err(|_| "Invalid Tailscale status encoding".into())
 }
 
 #[cfg(test)]

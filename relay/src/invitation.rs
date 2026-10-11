@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::tailscale::{LocalDevice, is_tailnet_ipv4};
 
 pub const INVITATION_LIFETIME_SECS: u64 = 24 * 60 * 60;
+const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 const PREFIX: &str = "wolflink://join/";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,7 +96,7 @@ impl Invitation {
             || !self.host_key.starts_with("nodekey:")
             || self.host_key.len() > 256
             || self.expires_at <= now
-            || self.expires_at - now > INVITATION_LIFETIME_SECS
+            || self.expires_at - now > INVITATION_LIFETIME_SECS + MAX_CLOCK_SKEW_SECS
         {
             return Err("Invalid or expired invitation".into());
         }

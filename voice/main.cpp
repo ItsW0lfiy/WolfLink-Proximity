@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -32,7 +33,8 @@ bool valid_signal_payload(const std::string& payload) {
 }
 
 int main(int argc, char** argv) {
-    const bool machine = argc == 4 && std::string(argv[3]) == "--machine";
+    const bool private_secret_machine = argc == 3 && std::string(argv[2]) == "--machine";
+    const bool machine = private_secret_machine || (argc == 4 && std::string(argv[3]) == "--machine");
     if ((argc != 3 && !machine) ||
         (machine && GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE)) {
         std::cerr << "Usage: wolflink_voice_poc <discord_application_id> <shared_lobby_secret> [--machine (piped stdout only)]\n";
@@ -47,7 +49,9 @@ int main(int argc, char** argv) {
         std::cerr << "Invalid Discord application ID\n";
         return 2;
     }
-    const std::string lobby_secret = argv[2];
+    const char* private_secret = std::getenv("WOLFLINK_LOBBY_SECRET");
+    const std::string lobby_secret = private_secret_machine
+        ? (private_secret ? private_secret : "") : argv[2];
     if (application_id == 0 || lobby_secret.size() < 16) {
         std::cerr << "Application ID must be nonzero; lobby secret must have at least 16 characters\n";
         return 2;
@@ -60,6 +64,7 @@ int main(int argc, char** argv) {
     }, discordpp::LoggingSeverity::Warning);
 
     std::optional<discordpp::Call> call;
+    bool desired_self_mute = false;
     bool lobby_requested = false;
     uint64_t self_id = 0;
     bool ready = false;
@@ -133,6 +138,7 @@ int main(int argc, char** argv) {
                 return;
             }
             call = std::move(started);
+            call->SetSelfMute(desired_self_mute);
             call->SetStatusChangedCallback([](auto call_status, auto call_error, auto detail) {
                 std::cout << "Call status: " << discordpp::Call::StatusToString(call_status) << '\n';
                 if (call_error != discordpp::Call::Error::None) {
@@ -283,12 +289,13 @@ int main(int argc, char** argv) {
                 } else {
                     std::cerr << "Invalid lobby signaling command\n";
                 }
-            } else if (command == "self-mute" && call && !machine) {
+            } else if (command == "self-mute") {
                 std::string value;
                 stream >> value;
                 if (value == "on" || value == "off") {
-                    call->SetSelfMute(value == "on");
-                    std::cout << "Self mute=" << (call->GetSelfMute() ? "on" : "off") << '\n';
+                    desired_self_mute = value == "on";
+                    if (call) call->SetSelfMute(desired_self_mute);
+                    std::cout << "Self mute=" << (desired_self_mute ? "on" : "off") << '\n';
                 } else {
                     std::cerr << "Usage: self-mute on|off\n";
                 }

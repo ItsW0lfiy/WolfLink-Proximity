@@ -3,20 +3,25 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use wolflink_relay::invitation::{Invitation, RoomMode, unix_now};
+use wolflink_relay::tailscale::{parse_local_status, status_json, verify_peer_status};
 use wolflink_relay::{ClientMessage, Participant, Position, ServerMessage, volume_for_distance};
 
 const LOCAL_MAX_AGE: Duration = Duration::from_millis(500);
 const REMOTE_MAX_AGE: Duration = Duration::from_millis(500);
 const MAX_DISTANCE: f32 = 60.0;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Sample {
+    username: String,
     position: Position,
     received_at: Instant,
 }
@@ -29,6 +34,12 @@ enum VoiceEvent {
     Closed,
 }
 
+enum Control {
+    Quit,
+    Mute(bool),
+    Loudness(u16),
+}
+
 struct Config {
     app_id: String,
     room_secret: String,
@@ -36,6 +47,9 @@ struct Config {
     relay_url: String,
     voice_exe: PathBuf,
     telemetry_exe: Option<PathBuf>,
+    username: Option<String>,
+    invitation: Option<Invitation>,
+    loudness_percent: u16,
 }
 
 fn config() -> Result<Config, String> {
@@ -44,6 +58,9 @@ fn config() -> Result<Config, String> {
 }
 
 fn parse_config(args: &[String]) -> Result<Config, String> {
+    if args.len() == 2 && args[1] == "--managed" {
+        return managed_config();
+    }
     if args.len() != 7 {
         return Err("Usage: client <application_id> <room_secret> <simulated_session_key> <wss://relay> <voice_exe> --simulate".into());
     }
@@ -74,7 +91,70 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
         relay_url: relay_url.clone(),
         voice_exe: PathBuf::from(&args[5]),
         telemetry_exe: (args[6] != "--simulate").then(|| PathBuf::from(&args[6])),
+        username: None,
+        invitation: None,
+        loudness_percent: 100,
     })
+}
+
+fn managed_config() -> Result<Config, String> {
+    let encoded =
+        env::var("WOLFLINK_ROOM_INVITE").map_err(|_| "Managed room invitation is missing")?;
+    let invitation = Invitation::decode(&encoded, unix_now()?)?;
+    let voice_exe =
+        PathBuf::from(env::var_os("WOLFLINK_VOICE_EXE").ok_or("Voice bridge path is missing")?);
+    let loudness_percent = env::var("WOLFLINK_LOUDNESS_PERCENT")
+        .unwrap_or_else(|_| "100".into())
+        .parse::<u16>()
+        .map_err(|_| "Invalid loudness setting")?;
+    if !(50..=150).contains(&loudness_percent) {
+        return Err("Loudness must be 50..150 percent".into());
+    }
+    let (telemetry_exe, username) = match invitation.mode {
+        RoomMode::Simulated => (None, None),
+        RoomMode::ExperimentalRoblox => {
+            if env::var("WOLFLINK_EXPERIMENTAL_ACK").ok().as_deref() != Some("1") {
+                return Err(
+                    "Unverified Roblox Server mode requires explicit acknowledgement".into(),
+                );
+            }
+            let name = env::var("WOLFLINK_ROBLOX_USERNAME")
+                .map_err(|_| "Your exact Roblox username is required in experimental mode")?;
+            if name.is_empty()
+                || name.len() > 64
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err("Invalid Roblox username".into());
+            }
+            let reader = PathBuf::from(
+                env::var_os("WOLFLINK_READER_EXE").ok_or("Telemetry reader path is missing")?,
+            );
+            (Some(reader), Some(name))
+        }
+    };
+    let relay_url = format!("ws://{}:{}", invitation.host_address, invitation.port);
+    Ok(Config {
+        app_id: invitation.application_id.to_string(),
+        room_secret: invitation.room_secret.clone(),
+        game_session: invitation.session_key.clone(),
+        relay_url,
+        voice_exe,
+        telemetry_exe,
+        username,
+        invitation: Some(invitation),
+        loudness_percent,
+    })
+}
+
+fn verify_tailnet_target(invitation: &Invitation) -> Result<(), String> {
+    invitation.validate(unix_now()?)?;
+    let json = status_json()?;
+    if parse_local_status(&json).is_ok_and(|local| {
+        local.address == invitation.host_address && local.public_key == invitation.host_key
+    }) {
+        return Ok(());
+    }
+    verify_peer_status(&json, invitation.host_address, &invitation.host_key)
 }
 
 fn parse_reader_line(line: &str, now: Instant) -> Option<Sample> {
@@ -82,24 +162,41 @@ fn parse_reader_line(line: &str, now: Instant) -> Option<Sample> {
         return None;
     }
     let fields = line.split_whitespace().collect::<Vec<_>>();
-    if fields.len() != 4 || fields[0] != "POS" {
+    if fields.len() != 5
+        || fields[0] != "POS"
+        || fields[1].is_empty()
+        || !fields[1]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         return None;
     }
     let position = Position {
-        x: fields[1].parse().ok()?,
-        y: fields[2].parse().ok()?,
-        z: fields[3].parse().ok()?,
+        x: fields[2].parse().ok()?,
+        y: fields[3].parse().ok()?,
+        z: fields[4].parse().ok()?,
     };
     position.valid().then_some(Sample {
+        username: fields[1].to_string(),
         position,
         received_at: now,
     })
 }
 
-async fn reader_task(path: PathBuf, samples: watch::Sender<Option<Sample>>) {
+async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Option<Sample>>) {
+    let mut last_username = None::<String>;
+    eprintln!("Roblox telemetry unavailable; discovering local player");
     loop {
         let child = Command::new(&path)
-            .args(["stream-telemetry", "--machine", "--hz", "20"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "stream-telemetry",
+                "--machine",
+                "--hz",
+                "20",
+                "--username",
+                &username,
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -109,9 +206,21 @@ async fn reader_task(path: PathBuf, samples: watch::Sender<Option<Sample>>) {
                 if let Some(stdout) = child.stdout.take() {
                     let mut lines = BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let _ = samples.send(parse_reader_line(&line, Instant::now()));
+                        let sample = parse_reader_line(&line, Instant::now())
+                            .filter(|value| value.username == username);
+                        if let Some(value) = &sample
+                            && last_username.as_deref() != Some(&value.username)
+                        {
+                            eprintln!("Roblox player: {}", value.username);
+                            last_username = Some(value.username.clone());
+                        }
+                        if sample.is_none() && last_username.take().is_some() {
+                            eprintln!("Roblox telemetry unavailable");
+                        }
+                        let _ = samples.send(sample);
                     }
                 }
+                last_username = None;
                 let _ = samples.send(None);
                 let _ = child.wait().await;
             }
@@ -124,8 +233,13 @@ async fn reader_task(path: PathBuf, samples: watch::Sender<Option<Sample>>) {
     }
 }
 
-async fn simulated_input(samples: watch::Sender<Option<Sample>>) {
-    eprintln!("Simulated telemetry: type 'position X Y Z', 'unavailable', or 'quit'.");
+async fn input_task(
+    samples: Option<watch::Sender<Option<Sample>>>,
+    controls: mpsc::Sender<Control>,
+) {
+    if samples.is_some() {
+        eprintln!("Simulated telemetry: type 'position X Y Z', 'unavailable', or 'quit'.");
+    }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut position = None::<Position>;
     let mut ticks = interval(Duration::from_millis(50));
@@ -133,13 +247,28 @@ async fn simulated_input(samples: watch::Sender<Option<Sample>>) {
         tokio::select! {
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else { break; };
-                if line.trim() == "quit" { break; }
+                let line = line.trim();
+                if line == "quit" { break; }
+                if line == "mute on" || line == "mute off" {
+                    let _ = controls.send(Control::Mute(line == "mute on")).await;
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("loudness ") {
+                    if let Ok(value) = value.parse::<u16>() && (50..=150).contains(&value) {
+                        let _ = controls.send(Control::Loudness(value)).await;
+                    } else {
+                        eprintln!("Loudness must be 50..150 percent");
+                    }
+                    continue;
+                }
+                let Some(samples) = &samples else { eprintln!("Unknown control command"); continue; };
                 if line.trim() == "unavailable" {
                     position = None;
                     let _ = samples.send(None);
                     continue;
                 }
-                if let Some(sample) = parse_reader_line(&line.replacen("position", "POS", 1), Instant::now()) {
+                if let Some(sample) = line.strip_prefix("position ")
+                    .and_then(|coordinates| parse_reader_line(&format!("POS simulated {coordinates}"), Instant::now())) {
                     position = Some(sample.position);
                     let _ = samples.send(Some(sample));
                 } else {
@@ -149,13 +278,41 @@ async fn simulated_input(samples: watch::Sender<Option<Sample>>) {
                 }
             }
             _ = ticks.tick() => {
-                if let Some(position) = position {
-                    let _ = samples.send(Some(Sample { position, received_at: Instant::now() }));
+                if let (Some(samples), Some(position)) = (&samples, position) {
+                    let _ = samples.send(Some(Sample { username: "simulated".into(), position, received_at: Instant::now() }));
                 }
             }
         }
     }
-    let _ = samples.send(None);
+    if let Some(samples) = samples {
+        let _ = samples.send(None);
+    }
+    let _ = controls.send(Control::Quit).await;
+}
+
+async fn apply_control(
+    control: Control,
+    voice_input: &mut ChildStdin,
+    loudness: &AtomicU16,
+) -> Result<bool, String> {
+    match control {
+        Control::Quit => Ok(true),
+        Control::Mute(muted) => {
+            voice_input
+                .write_all(if muted {
+                    b"self-mute on\n"
+                } else {
+                    b"self-mute off\n"
+                })
+                .await
+                .map_err(|error| format!("Voice mute control failed: {error}"))?;
+            Ok(false)
+        }
+        Control::Loudness(value) => {
+            loudness.store(value, Ordering::Relaxed);
+            Ok(false)
+        }
+    }
 }
 
 fn sample_is_fresh(sample: Option<Sample>, now: Instant) -> Option<Position> {
@@ -180,6 +337,10 @@ fn volume_needs_update(previous: Option<f32>, target: f32) -> bool {
     previous.is_none_or(|previous| {
         (target == 0.0 && previous != 0.0) || (previous - target).abs() >= 0.5
     })
+}
+
+fn scaled_volume(gain: f32, loudness_percent: u16) -> f32 {
+    (gain * f32::from(loudness_percent) / 100.0).clamp(0.0, 120.0)
 }
 
 struct GainState {
@@ -243,6 +404,7 @@ async fn apply_volumes(
     local: Option<Position>,
     remote: &[Participant],
     remote_fresh: bool,
+    loudness_percent: u16,
 ) -> Result<(), String> {
     let now = Instant::now();
     for peer in peers {
@@ -257,7 +419,7 @@ async fn apply_volumes(
             None
         };
         let gain = gains.entry(*peer).or_insert_with(|| GainState::muted(now));
-        let target = gain.advance(positions, now);
+        let target = scaled_volume(gain.advance(positions, now), loudness_percent);
         if volume_needs_update(gain.last_sent, target) {
             write_volume(voice_input, *peer, target).await?;
             gain.last_sent = Some(target);
@@ -274,7 +436,12 @@ async fn run_connected(
     voice_input: &mut ChildStdin,
     peers: &mut HashSet<u64>,
     self_id: &mut Option<u64>,
-) -> Result<(), String> {
+    controls: &mut mpsc::Receiver<Control>,
+    loudness: &AtomicU16,
+) -> Result<bool, String> {
+    if let Some(invitation) = &config.invitation {
+        verify_tailnet_target(invitation)?;
+    }
     let (mut ws, _) = connect_async(&config.relay_url)
         .await
         .map_err(|error| format!("Relay connection failed: {error}"))?;
@@ -292,8 +459,34 @@ async fn run_connected(
     let mut gains = HashMap::<u64, GainState>::new();
     let mut server_id = None::<u64>;
     let mut ticks = interval(Duration::from_millis(50));
+    let mut tail_checks = interval(Duration::from_secs(5));
+    let mut last_tail_verified = Instant::now();
+    let mut tail_check = None::<tokio::task::JoinHandle<Result<(), String>>>;
     loop {
         tokio::select! {
+            control = controls.recv() => {
+                if apply_control(control.unwrap_or(Control::Quit), voice_input, loudness).await? {
+                    return Ok(true);
+                }
+            }
+            _ = tail_checks.tick(), if config.invitation.is_some() && tail_check.is_none() => {
+                let invitation = config.invitation.as_ref().unwrap().clone();
+                tail_check = Some(tokio::task::spawn_blocking(move || verify_tailnet_target(&invitation)));
+            }
+            result = async { tail_check.as_mut().unwrap().await }, if tail_check.is_some() => {
+                tail_check = None;
+                match result {
+                    Ok(Ok(())) => last_tail_verified = Instant::now(),
+                    other => {
+                        for peer in peers.iter() { write_volume(voice_input, *peer, 0.0).await?; }
+                        return Err(match other {
+                            Ok(Err(error)) => error,
+                            Err(error) => format!("Tailnet identity check failed: {error}"),
+                            _ => unreachable!(),
+                        });
+                    }
+                }
+            }
             frame = ws.next() => {
                 let Some(Ok(Message::Text(text))) = frame else {
                     return Err("Relay disconnected".into());
@@ -342,16 +535,18 @@ async fn run_connected(
             }
             _ = ticks.tick() => {
                 let now = Instant::now();
-                let local = sample_is_fresh(*samples.borrow(), now);
+                let tail_fresh = config.invitation.is_none()
+                    || now.saturating_duration_since(last_tail_verified) <= Duration::from_secs(7);
+                let local = if tail_fresh { sample_is_fresh(samples.borrow().clone(), now) } else { None };
                 let outbound = match local {
                     Some(position) => ClientMessage::Position { position },
                     None => ClientMessage::Unavailable,
                 };
                 ws.send(Message::Text(serde_json::to_string(&outbound).unwrap().into()))
                     .await.map_err(|error| format!("Relay send failed: {error}"))?;
-                let remote_fresh = server_id.is_some_and(|id| *self_id == Some(id))
+                let remote_fresh = tail_fresh && server_id.is_some_and(|id| *self_id == Some(id))
                     && last_snapshot.is_some_and(|time| now.saturating_duration_since(time) <= REMOTE_MAX_AGE);
-                apply_volumes(voice_input, peers, &mut gains, local, &remote, remote_fresh).await?;
+                apply_volumes(voice_input, peers, &mut gains, local, &remote, remote_fresh, loudness.load(Ordering::Relaxed)).await?;
             }
         }
     }
@@ -361,13 +556,26 @@ async fn run_connected(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let (samples_tx, samples_rx) = watch::channel(None::<Sample>);
-    let telemetry_task = match &config.telemetry_exe {
-        Some(path) => tokio::spawn(reader_task(path.clone(), samples_tx)),
-        None => tokio::spawn(simulated_input(samples_tx)),
+    let (controls_tx, mut controls_rx) = mpsc::channel::<Control>(32);
+    let loudness = AtomicU16::new(config.loudness_percent);
+    let telemetry_task = config.telemetry_exe.as_ref().map(|path| {
+        tokio::spawn(reader_task(
+            path.clone(),
+            config.username.clone().unwrap(),
+            samples_tx.clone(),
+        ))
+    });
+    let input_samples = if config.telemetry_exe.is_none() {
+        Some(samples_tx)
+    } else {
+        None
     };
+    let input_handle = tokio::spawn(input_task(input_samples, controls_tx));
 
     let mut voice = Command::new(&config.voice_exe)
-        .args([&config.app_id, &config.room_secret, "--machine"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([&config.app_id, "--machine"])
+        .env("WOLFLINK_LOBBY_SECRET", &config.room_secret)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
@@ -412,6 +620,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if token.is_none() {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
+                control = controls_rx.recv() => {
+                    if apply_control(control.unwrap_or(Control::Quit), &mut voice_input, &loudness).await? { break; }
+                }
                 event = events_rx.recv() => {
                     match event {
                         Some(VoiceEvent::Auth(value)) => token = Some(value),
@@ -425,15 +636,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
-                result = run_connected(&config, token.as_deref().unwrap(), &samples_rx, &mut events_rx, &mut voice_input, &mut peers, &mut self_id) => {
+                result = run_connected(&config, token.as_deref().unwrap(), &samples_rx, &mut events_rx, &mut voice_input, &mut peers, &mut self_id, &mut controls_rx, &loudness) => {
+                    if matches!(result, Ok(true)) { break; }
                     if let Err(error) = result { eprintln!("{error}"); }
                     for id in &peers { write_volume(&mut voice_input, *id, 0.0).await?; }
+                    if config.invitation.as_ref().is_some_and(|invite|
+                        invite.validate(unix_now().unwrap_or(u64::MAX)).is_err()) {
+                        eprintln!("Room invitation expired; leave and create a new room");
+                        break;
+                    }
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         }
     }
-    telemetry_task.abort();
+    input_handle.abort();
+    if let Some(task) = telemetry_task {
+        task.abort();
+    }
     let _ = voice_input.write_all(b"quit\n").await;
     let _ = voice.wait().await;
     Ok(())
@@ -446,9 +666,10 @@ mod tests {
     #[test]
     fn reader_lines_require_valid_position() {
         let now = Instant::now();
-        assert!(parse_reader_line("POS 1 2 3", now).is_some());
+        assert!(parse_reader_line("POS orwell213 1 2 3", now).is_some());
         assert!(parse_reader_line("UNAVAILABLE", now).is_none());
-        assert!(parse_reader_line("POS NaN 2 3", now).is_none());
+        assert!(parse_reader_line("POS orwell213 NaN 2 3", now).is_none());
+        assert!(parse_reader_line("POS <unknown> 1 2 3", now).is_none());
         assert!(parse_reader_line("Local player: x", now).is_none());
     }
 
@@ -456,6 +677,7 @@ mod tests {
     fn stale_local_sample_is_muted() {
         let now = Instant::now();
         let sample = Sample {
+            username: "test".into(),
             position: Position {
                 x: 1.0,
                 y: 2.0,
@@ -534,5 +756,13 @@ mod tests {
         );
         args[6] = "--simulate".into();
         assert!(parse_config(&args).is_ok());
+    }
+
+    #[test]
+    fn loudness_scales_gain_without_changing_range_or_unsafe_mute() {
+        assert_eq!(scaled_volume(25.0, 50), 12.5);
+        assert_eq!(scaled_volume(25.0, 150), 37.5);
+        assert_eq!(scaled_volume(100.0, 150), 120.0);
+        assert_eq!(scaled_volume(0.0, 150), 0.0);
     }
 }
