@@ -1,6 +1,6 @@
 [package]
 name = "roblox-memory-scanner"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 
 [profile.release]
@@ -8,5 +8,5 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = ["relay", "p2p-probe", "app"]
+members = ["relay", "p2p-probe", "app", "update"]
 

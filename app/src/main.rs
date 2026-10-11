@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -18,8 +18,12 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 use wolflink_relay::invitation::{Invitation, RoomMode, unix_now};
 use wolflink_relay::tailscale::{parse_local_status, status_json};
+use wolflink_update::{
+    Channel, CheckResult, UpdateClient, embedded_public_key, load_recorded_policy, record_policy,
+};
 
 const APPLICATION_ID: u64 = 1558817526497157150;
 const ROOM_PORT: u16 = 8765;
@@ -74,6 +78,7 @@ enum Action {
         acknowledged: bool,
     },
     Control(String),
+    ApplyUpdate(CheckResult),
     Stop,
     Exit,
 }
@@ -89,6 +94,272 @@ enum Event {
     Stopped,
     Line(String),
     Error(String),
+    UpdateCurrent,
+    UpdateAvailable(CheckResult),
+    UpdateStatus(String),
+    UpdateRestarting,
+    UpdatePolicyBlocked(String),
+}
+
+fn update_policy_path() -> Result<PathBuf, String> {
+    Ok(std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("LOCALAPPDATA is unavailable")?
+        .join("WolfLink")
+        .join("updates")
+        .join("policy.json"))
+}
+
+fn spawn_update_checks(events: Sender<Event>) {
+    thread::spawn(move || {
+        let key = match embedded_public_key() {
+            Ok(key) => key,
+            Err(error) => {
+                let _ = events.send(Event::UpdateStatus(error));
+                return;
+            }
+        };
+        let client = match UpdateClient::official(key) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = events.send(Event::UpdateStatus(error));
+                return;
+            }
+        };
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let channel = Channel::for_version(&current);
+        let policy_path = match update_policy_path() {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = events.send(Event::UpdatePolicyBlocked(error));
+                return;
+            }
+        };
+        let mut recorded = match load_recorded_policy(&policy_path, &key) {
+            Ok(policy) => policy,
+            Err(error) => {
+                let _ = events.send(Event::UpdatePolicyBlocked(format!(
+                    "Cannot verify recorded policy: {error}"
+                )));
+                return;
+            }
+        };
+        if let Some(policy) = &recorded
+            && let Ok(verified) = policy.verify(&key)
+            && current < verified.minimum
+        {
+            let _ = events.send(Event::UpdatePolicyBlocked(format!(
+                "Version {} or newer is required",
+                verified.minimum
+            )));
+        }
+        let mut failures = 0u32;
+        loop {
+            let _ = events.send(Event::UpdateStatus("Checking for updates…".into()));
+            match client.check(&current, channel, recorded.as_ref()) {
+                Ok(CheckResult::Current) => {
+                    failures = 0;
+                    let _ = events.send(Event::UpdateCurrent);
+                }
+                Ok(offer @ CheckResult::Available { .. }) => {
+                    if let CheckResult::Available { signed, .. } = &offer {
+                        match record_policy(&policy_path, signed, &key) {
+                            Ok(()) => {
+                                recorded = Some((**signed).clone());
+                                failures = 0;
+                                let _ = events.send(Event::UpdateAvailable(offer));
+                            }
+                            Err(error) => {
+                                let _ = events.send(Event::UpdatePolicyBlocked(format!(
+                                    "Cannot save verified policy: {error}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    let _ = events.send(Event::UpdateStatus(format!(
+                        "Update check unavailable: {error}"
+                    )));
+                }
+            }
+            let delay = if failures == 0 {
+                Duration::from_secs(6 * 60 * 60)
+            } else {
+                Duration::from_secs((5 * 60 * 2u64.pow(failures.min(4))).min(60 * 60))
+            };
+            thread::sleep(delay);
+        }
+    });
+}
+
+fn prepare_update(offer: CheckResult, events: &Sender<Event>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let CheckResult::Available {
+        manifest,
+        signed,
+        artifact_url,
+        ..
+    } = offer
+    else {
+        return Err("No verified update is available".into());
+    };
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("LOCALAPPDATA is unavailable")?
+        .join("WolfLink")
+        .join("updates");
+    std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let session = root.join(format!(
+        "download-{}-{}-{nonce}",
+        manifest.version,
+        std::process::id()
+    ));
+    std::fs::create_dir(&session).map_err(|error| error.to_string())?;
+    let zip = session.join(&manifest.payload.artifact);
+    let manifest_path = session.join(wolflink_update::MANIFEST_NAME);
+    let client = UpdateClient::official(embedded_public_key()?)?;
+    let _ = events.send(Event::UpdateStatus(format!(
+        "Downloading WolfLink {}…",
+        manifest.version
+    )));
+    client.download(&artifact_url, &manifest, &zip)?;
+    let _ = events.send(Event::UpdateStatus("Verifying signed update…".into()));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&signed).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let helper = session.join("WolfLinkUpdater.exe");
+    let ready = session.join("ready");
+    std::fs::copy(child_path("WolfLinkUpdater.exe")?, &helper)
+        .map_err(|error| format!("Cannot stage update helper: {error}"))?;
+    let install = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or("Application install directory unavailable")?
+        .to_path_buf();
+    let mut helper_process = Command::new(helper)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "--apply",
+            install.to_str().ok_or("Invalid install path")?,
+            zip.to_str().ok_or("Invalid update path")?,
+            manifest_path.to_str().ok_or("Invalid manifest path")?,
+            &std::process::id().to_string(),
+            ready.to_str().ok_or("Invalid handoff path")?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start update helper: {error}"))?;
+    for _ in 0..1200 {
+        if let Some(status) = helper_process
+            .try_wait()
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "Update helper failed preflight ({status}); WolfLink remains open"
+            ));
+        }
+        if ready.is_file() {
+            let _ = events.send(Event::UpdateRestarting);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = helper_process.kill();
+    let _ = helper_process.wait();
+    Err("Update helper preflight timed out; WolfLink remains open".into())
+}
+
+fn recover_interrupted_update() -> Result<bool, String> {
+    use std::os::windows::process::CommandExt;
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("LOCALAPPDATA is unavailable")?
+        .join("WolfLink")
+        .join("updates");
+    let journal = root.join("pending.json");
+    if !journal.exists() {
+        return Ok(false);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).map_err(|error| error.to_string())?)
+            .map_err(|_| "Update recovery journal is malformed")?;
+    let recorded_install = value
+        .get("install")
+        .and_then(|value| value.as_str())
+        .ok_or("Update recovery journal lacks install identity")?;
+    let this_install = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or("Application install directory unavailable")?
+        .to_path_buf();
+    if std::fs::canonicalize(recorded_install).map_err(|error| error.to_string())?
+        != std::fs::canonicalize(this_install).map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    let pid = value
+        .get("helper_pid")
+        .and_then(|value| value.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or("Update recovery journal lacks helper identity")?;
+    let handle = unsafe { OpenProcess(0x0010_0000, 0, pid) };
+    if !handle.is_null() {
+        let running = unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT };
+        unsafe { CloseHandle(handle) };
+        if running {
+            return Ok(false);
+        }
+    }
+    Command::new(child_path("WolfLinkUpdater.exe")?)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["--recover", &std::process::id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Cannot start update recovery: {error}"))?;
+    Ok(true)
+}
+
+fn show_previous_update_error() {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let path = PathBuf::from(local)
+        .join("WolfLink")
+        .join("updates")
+        .join("last-error.txt");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let error = String::from_utf8_lossy(&bytes);
+    let message: Vec<u16> = format!(
+        "WolfLink update could not finish. The previous version remains available.\n\n{}\0",
+        error.chars().take(500).collect::<String>()
+    )
+    .encode_utf16()
+    .collect();
+    let title: Vec<u16> = "WolfLink Update Error\0".encode_utf16().collect();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            0x10,
+        );
+    }
 }
 
 fn roblox_running() -> bool {
@@ -350,6 +621,7 @@ fn start_room(
 }
 
 fn worker(actions: Receiver<Action>, events: Sender<Event>) {
+    spawn_update_checks(events.clone());
     let mut current: Option<Processes> = None;
     let mut last_tailnet = Instant::now() - Duration::from_secs(10);
     loop {
@@ -473,6 +745,22 @@ fn worker(actions: Receiver<Action>, events: Sender<Event>) {
                     }
                 }
             }
+            Ok(Action::ApplyUpdate(offer)) => {
+                if current.is_some() {
+                    let _ = events.send(Event::UpdateStatus(
+                        "Update deferred until the room is closed".into(),
+                    ));
+                } else {
+                    let events = events.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = prepare_update(offer, &events) {
+                            let _ = events.send(Event::UpdateStatus(format!(
+                                "Update failed safely: {error}"
+                            )));
+                        }
+                    });
+                }
+            }
             Ok(Action::Stop) => {
                 if let Some(mut processes) = current.take() {
                     processes.stop();
@@ -493,6 +781,26 @@ fn worker(actions: Receiver<Action>, events: Sender<Event>) {
 mod ui;
 
 fn main() {
+    match recover_interrupted_update() {
+        Ok(true) => return,
+        Err(error) => {
+            let message: Vec<u16> = format!("WolfLink update recovery failed: {error}\0")
+                .encode_utf16()
+                .collect();
+            let title: Vec<u16> = "WolfLink Update Error\0".encode_utf16().collect();
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    std::ptr::null_mut(),
+                    message.as_ptr(),
+                    title.as_ptr(),
+                    0x10,
+                );
+            }
+            return;
+        }
+        Ok(false) => {}
+    }
+    show_previous_update_error();
     ui::run();
 }
 

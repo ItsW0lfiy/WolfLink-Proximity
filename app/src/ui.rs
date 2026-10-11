@@ -29,6 +29,8 @@ const ID_Y: u16 = 113;
 const ID_Z: u16 = 114;
 const ID_POSITION: u16 = 115;
 const ID_UNAVAILABLE: u16 = 116;
+const ID_UPDATE_NOTES: u16 = 117;
+const ID_UPDATE_NOW: u16 = 118;
 
 thread_local! { static STATE: RefCell<Option<Ui>> = const { RefCell::new(None) }; }
 
@@ -145,6 +147,7 @@ fn clipboard(hwnd: HWND, value: &str) -> Result<(), &'static str> {
 }
 
 struct Ui {
+    hwnd: HWND,
     actions: Sender<Action>,
     events: Receiver<Event>,
     preferences: Preferences,
@@ -167,6 +170,12 @@ struct Ui {
     hosting: bool,
     room_mode: RoomMode,
     telemetry_valid: bool,
+    update_status: HWND,
+    update_offer: Option<CheckResult>,
+    update_due: Option<Instant>,
+    update_notes: String,
+    mandatory_update: bool,
+    updating: bool,
 }
 
 impl Ui {
@@ -178,7 +187,7 @@ impl Ui {
         unsafe {
             label(
                 hwnd,
-                "WolfLink Proximity 0.1.0-alpha.1 — private pre-release",
+                concat!("WolfLink Proximity ", env!("CARGO_PKG_VERSION"), " — alpha"),
                 20,
                 15,
                 700,
@@ -407,14 +416,31 @@ impl Ui {
                 90,
                 0,
             );
-            label(
+            let update_status = label(hwnd, "Updates: checking…", 20, 682, 550);
+            control(
                 hwnd,
-                "Updates: not configured in development build · Audio device: system default",
-                20,
-                682,
-                730,
+                "BUTTON",
+                "Notes",
+                WS_CHILD | WS_VISIBLE,
+                585,
+                678,
+                75,
+                28,
+                ID_UPDATE_NOTES,
+            );
+            control(
+                hwnd,
+                "BUTTON",
+                "Install",
+                WS_CHILD | WS_VISIBLE,
+                668,
+                678,
+                80,
+                28,
+                ID_UPDATE_NOW,
             );
             Self {
+                hwnd,
                 actions,
                 events,
                 preferences,
@@ -437,6 +463,12 @@ impl Ui {
                 hosting: false,
                 room_mode: RoomMode::Simulated,
                 telemetry_valid: false,
+                update_status,
+                update_offer: None,
+                update_due: None,
+                update_notes: String::new(),
+                mandatory_update: false,
+                updating: false,
             }
         }
     }
@@ -480,6 +512,8 @@ impl Ui {
                     if (!self.connected || self.room_mode == RoomMode::ExperimentalRoblox)
                         && !self.telemetry_valid
                         && !text(self.roblox_state).starts_with("Roblox discovery failed:")
+                        && !text(self.roblox_state)
+                            .starts_with("Read-only Roblox provider: unsupported")
                     {
                         set_text(
                             self.roblox_state,
@@ -543,6 +577,9 @@ impl Ui {
                         set_text(self.status, "Not connected");
                     }
                     set_text(self.participants_view, "None");
+                    if self.update_offer.is_some() && !self.updating {
+                        self.update_due = Some(Instant::now() + Duration::from_secs(5));
+                    }
                 }
                 Event::Line(line) => {
                     if line.contains("Call status: Connected") {
@@ -560,7 +597,7 @@ impl Ui {
                         set_text(
                             self.roblox_state,
                             &format!(
-                                "Real Roblox telemetry: valid for {name} (Unverified Roblox Server)"
+                                "Read-only Roblox provider: {name} verified; XYZ valid (Unverified Server)"
                             ),
                         );
                     } else if line.contains("Roblox telemetry unavailable") {
@@ -573,13 +610,17 @@ impl Ui {
                         line.strip_prefix("WolfLink: Roblox reader: Roblox discovery failed: ")
                     {
                         self.telemetry_valid = false;
-                        set_text(
-                            self.roblox_state,
-                            &format!(
+                        let unsupported = reason.contains("does not match the validated");
+                        let message = if unsupported {
+                            "Read-only Roblox provider: unsupported client; XYZ unavailable"
+                                .to_string()
+                        } else {
+                            format!(
                                 "Roblox discovery failed: {}",
                                 reason.chars().take(90).collect::<String>()
-                            ),
-                        );
+                            )
+                        };
+                        set_text(self.roblox_state, &message);
                     }
                     self.record(line);
                 }
@@ -587,12 +628,88 @@ impl Ui {
                     set_text(self.status, &format!("Error: {error}"));
                     self.record(format!("Error: {error}"));
                 }
+                Event::UpdateCurrent => {
+                    if self.update_offer.is_none() && !self.mandatory_update {
+                        set_text(self.update_status, "Updates: current");
+                    }
+                }
+                Event::UpdateAvailable(offer) => {
+                    if let CheckResult::Available {
+                        manifest,
+                        notes,
+                        mandatory,
+                        ..
+                    } = &offer
+                    {
+                        self.mandatory_update = *mandatory;
+                        self.update_notes = notes.clone();
+                        set_text(
+                            self.update_status,
+                            &format!(
+                                "Update {} {}",
+                                manifest.version,
+                                if *mandatory { "required" } else { "available" },
+                            ),
+                        );
+                        self.update_due = Some(Instant::now() + Duration::from_secs(10));
+                        self.update_offer = Some(offer);
+                    }
+                }
+                Event::UpdateStatus(message) => {
+                    if message.starts_with("Update failed safely:") {
+                        self.updating = false;
+                        self.update_due = Some(Instant::now() + Duration::from_secs(30 * 60));
+                    }
+                    set_text(self.update_status, &format!("Updates: {message}"));
+                    if message.starts_with("Update failed safely:") {
+                        self.record(message);
+                    }
+                }
+                Event::UpdateRestarting => {
+                    set_text(self.update_status, "Updates: verified; restarting…");
+                    unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
+                }
+                Event::UpdatePolicyBlocked(reason) => {
+                    self.mandatory_update = true;
+                    set_text(self.update_status, &format!("Updates: {reason}"));
+                    self.record(format!("Update policy blocks new rooms: {reason}"));
+                }
             }
+        }
+        if !self.connected
+            && !self.updating
+            && self.update_due.is_some_and(|due| Instant::now() >= due)
+        {
+            self.start_update();
+        }
+    }
+
+    fn start_update(&mut self) {
+        if self.connected {
+            self.update_due = None;
+            set_text(self.update_status, "Updates: deferred until room ends");
+            return;
+        }
+        if let Some(offer) = self.update_offer.clone() {
+            self.updating = true;
+            self.update_due = None;
+            set_text(self.update_status, "Updates: downloading…");
+            let _ = self.actions.send(Action::ApplyUpdate(offer));
         }
     }
 
     fn command(&mut self, hwnd: HWND, id: u16) {
         match id {
+            ID_CREATE if !self.connected && self.mandatory_update => {
+                self.record(
+                    "A signed mandatory update must install before joining a new room".into(),
+                );
+            }
+            ID_JOIN if !self.connected && self.mandatory_update => {
+                self.record(
+                    "A signed mandatory update must install before joining a new room".into(),
+                );
+            }
             ID_CREATE if !self.connected => {
                 self.preferences.roblox_username = text(self.username);
                 let mode = if checked(self.experimental) {
@@ -674,6 +791,22 @@ impl Ui {
                     "Simulated telemetry: unavailable; voice fails closed",
                 );
             }
+            ID_UPDATE_NOTES => {
+                let notes = if self.update_notes.is_empty() {
+                    "No update release notes are available yet."
+                } else {
+                    &self.update_notes
+                };
+                unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(notes).as_ptr(),
+                        wide("WolfLink update notes").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+            ID_UPDATE_NOW => self.start_update(),
             _ => {}
         }
     }
