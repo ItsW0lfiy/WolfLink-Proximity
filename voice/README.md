@@ -32,7 +32,7 @@ The SDK owns capture and playback. No Discord token or client secret should be e
 
 During the two-PC test, an active RustDesk remote-desktop session caused a delayed self-echo; the echo was gone with RustDesk disconnected and WolfLink self-mute/self-deaf off. A separate fan-like sound persisted after WolfLink exited and was traced to the running Roblox game. Keep other audio/remote-desktop sessions out of controlled voice tests.
 
-The Rust relay client starts this executable with `--machine`, using a private stdout pipe for the short-lived OAuth token and stdin for volume commands. `--machine` refuses to run with terminal stdout. New voice participants are muted before their IDs are sent to the Rust client; the Rust client unmutes them only after authenticated relay identities and fresh matching-session positions are available.
+The Rust relay client starts this executable with `--machine`, using a private stdout pipe for the short-lived OAuth token and stdin for volume commands. `--machine` refuses to run with terminal stdout. New voice participants are muted before their IDs are sent to the Rust client; the Rust client unmutes them only after authenticated relay identities and fresh matching-session positions are available. The bridge reports departures so the Rust client removes stale participant gain state.
 
 ## Experimental lobby signaling boundary
 

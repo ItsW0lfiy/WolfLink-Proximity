@@ -101,6 +101,9 @@ int main(int argc, char** argv) {
             lobby_requested = false;
             active_lobby_id = 0;
             call.reset();
+            if (machine) {
+                for (auto user_id : seen_participants) std::cout << "LEFT " << user_id << std::endl;
+            }
             seen_participants.clear();
             return;
         }
@@ -146,7 +149,9 @@ int main(int argc, char** argv) {
                         std::cout << "PEER " << user_id << std::endl;
                     }
                 }
-                if (!added) seen_participants.erase(user_id);
+                if (!added && seen_participants.erase(user_id) && machine) {
+                    std::cout << "LEFT " << user_id << std::endl;
+                }
             });
             std::cout << "Voice call started. Commands: participants | volume <user_id> <0..200> | self-mute on|off | self-deaf on|off | quit\n";
         });
@@ -209,6 +214,7 @@ int main(int argc, char** argv) {
             }
             for (auto it = seen_participants.begin(); it != seen_participants.end();) {
                 if (!current_participants.count(*it)) {
+                    std::cout << "LEFT " << *it << std::endl;
                     it = seen_participants.erase(it);
                 } else {
                     ++it;

@@ -25,6 +25,7 @@ enum VoiceEvent {
     Auth(String),
     SelfId(u64),
     Peer(u64),
+    Left(u64),
     Closed,
 }
 
@@ -318,6 +319,10 @@ async fn run_connected(
                         gain.last_sent = Some(0.0);
                         gain.positions = None;
                     }
+                    Some(VoiceEvent::Left(id)) => {
+                        peers.remove(&id);
+                        gains.remove(&id);
+                    }
                     Some(VoiceEvent::SelfId(id)) => {
                         if server_id.is_some_and(|value| value != id) {
                             return Err("Voice and relay Discord identities differ".into());
@@ -375,6 +380,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id.parse().ok().map(VoiceEvent::SelfId)
             } else if let Some(id) = line.strip_prefix("PEER ") {
                 id.parse().ok().map(VoiceEvent::Peer)
+            } else if let Some(id) = line.strip_prefix("LEFT ") {
+                id.parse().ok().map(VoiceEvent::Left)
             } else if line.starts_with("SIGNAL ") {
                 // Negotiation is not enabled yet; do not log encoded peer candidates.
                 None
@@ -403,6 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(VoiceEvent::Auth(value)) => token = Some(value),
                         Some(VoiceEvent::SelfId(id)) => self_id = Some(id),
                         Some(VoiceEvent::Peer(id)) => { peers.insert(id); write_volume(&mut voice_input, id, 0.0).await?; }
+                        Some(VoiceEvent::Left(id)) => { peers.remove(&id); }
                         Some(VoiceEvent::Closed) | None => return Err("Voice bridge stopped before authentication".into()),
                     }
                 }
