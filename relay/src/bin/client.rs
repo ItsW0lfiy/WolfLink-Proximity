@@ -40,8 +40,15 @@ struct Config {
 
 fn config() -> Result<Config, String> {
     let args: Vec<String> = env::args().collect();
+    parse_config(&args)
+}
+
+fn parse_config(args: &[String]) -> Result<Config, String> {
     if args.len() != 7 {
-        return Err("Usage: client <application_id> <room_secret> <game_session> <wss://relay> <voice_exe> <telemetry_exe|--simulate>".into());
+        return Err("Usage: client <application_id> <room_secret> <simulated_session_key> <wss://relay> <voice_exe> --simulate".into());
+    }
+    if args[6] != "--simulate" {
+        return Err("Roblox-derived proximity is disabled: the reader has no independently verified Roblox server-instance ID. Run the reader separately, or use --simulate for an explicitly simulated test room.".into());
     }
     args[1]
         .parse::<u64>()
@@ -505,5 +512,27 @@ mod tests {
             gain.advance(Some((origin, remote)), now + Duration::from_millis(1050)),
             25.0
         );
+    }
+
+    #[test]
+    fn unverified_roblox_game_session_cannot_enable_real_proximity() {
+        let mut args = [
+            "client",
+            "123",
+            "secret-abcdefghijkl",
+            "claimed-session",
+            "ws://127.0.0.1:8765",
+            "voice.exe",
+            "reader.exe",
+        ]
+        .map(str::to_string);
+        assert!(
+            parse_config(&args)
+                .err()
+                .unwrap()
+                .contains("server-instance ID")
+        );
+        args[6] = "--simulate".into();
+        assert!(parse_config(&args).is_ok());
     }
 }
