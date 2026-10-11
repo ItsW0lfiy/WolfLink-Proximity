@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     auto verifier = client.CreateAuthorizationCodeVerifier();
     discordpp::AuthorizationArgs auth_args{};
     auth_args.SetClientId(application_id);
-    auth_args.SetScopes(discordpp::Client::GetDefaultCommunicationScopes());
+    auth_args.SetScopes(discordpp::Client::GetDefaultCommunicationScopes() + " identify");
     auth_args.SetCodeChallenge(verifier.Challenge());
     client.Authorize(auth_args, [&, verifier](auto result, auto code, auto redirect_uri) {
         if (!result.Successful()) {

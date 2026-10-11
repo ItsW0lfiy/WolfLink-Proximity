@@ -7,3 +7,6 @@ edition = "2024"
 lto = "thin"
 strip = true
 
+[workspace]
+members = ["relay"]
+
