@@ -41,4 +41,4 @@ The application must never use a public Roblox place ID alone as the game-sessio
 
 ## Current verification
 
-Unit tests cover private room and session separation, duplicate identities, invalid coordinates, 500 ms expiry, distance attenuation, and client fail-closed parsing/muting. WebSocket integration tests use a fake local Discord authorization endpoint to verify multiple users, room isolation, and token rejection. Live Discord authentication, SDK audio, two-PC communication, and a public `wss://` deployment remain unverified.
+Unit tests cover private room and session separation, duplicate identities, invalid coordinates, 500 ms expiry, distance attenuation, and client fail-closed parsing/muting. WebSocket integration tests use a fake local Discord authorization endpoint to verify multiple users, room isolation, and token rejection. A one-user loopback test verified live Discord authentication against `/oauth2/@me`, a matching SDK identity, and a connected SDK call while using simulated telemetry. Two-person audio, audible volume changes, and public `wss://` deployment remain unverified.

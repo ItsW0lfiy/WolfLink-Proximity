@@ -1,8 +1,8 @@
 # WolfLink Proximity
 
-WolfLink is an in-progress Discord-powered proximity-voice client. The Roblox reader discovers the running process, identifies the local player's character, and reads its world position without modifying or controlling Roblox. The Discord voice bridge and authenticated telemetry relay are separate components; see [voice/README.md](voice/README.md) and [relay/README.md).
+WolfLink is an in-progress Discord-powered proximity-voice client. The Roblox reader discovers the running process, identifies the local player's character, and reads its world position without modifying or controlling Roblox. The Discord voice bridge and authenticated telemetry relay are separate components; see [voice/README.md](voice/README.md) and [relay/README.md](relay/README.md).
 
-The relay and attenuation logic have automated tests. Live Discord voice is not yet verified: a Discord Developer application, its Social SDK download, a second authenticated PC, and a hosted `wss://` relay are still needed. Simulated coordinates can be used to test the voice/network path before enabling Roblox telemetry.
+The relay and attenuation logic have automated tests. The Windows voice bridge has been built against Discord Social SDK 1.10.19337, and one user authenticated, joined a lobby, and reached a connected call. Two-person audio, audible attenuation, and a hosted `wss://` relay remain unverified. Simulated coordinates can be used to test the voice/network path before enabling Roblox telemetry.
 
 ## Run
 

@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: wolflink_voice_poc <discord_application_id> <shared_lobby_secret> [--machine (piped stdout only)]\n";
         return 2;
     }
+    if (machine) std::cout << std::unitbuf;
 
     uint64_t application_id = 0;
     try {
@@ -45,10 +46,8 @@ int main(int argc, char** argv) {
     discordpp::Client client;
     client.SetApplicationId(application_id);
     client.AddLogCallback([](auto message, auto severity) {
-        if (severity == discordpp::LoggingSeverity::Error) {
-            std::cerr << "Discord SDK: " << message << '\n';
-        }
-    }, discordpp::LoggingSeverity::Error);
+        std::cerr << "Discord SDK (" << static_cast<int>(severity) << "): " << message << '\n';
+    }, discordpp::LoggingSeverity::Warning);
 
     std::optional<discordpp::Call> call;
     bool lobby_requested = false;
@@ -121,11 +120,13 @@ int main(int argc, char** argv) {
     auth_args.SetClientId(application_id);
     auth_args.SetScopes(discordpp::Client::GetDefaultCommunicationScopes() + " identify");
     auth_args.SetCodeChallenge(verifier.Challenge());
+    std::cout << "Starting Discord authorization; check Discord and your browser for approval.\n";
     client.Authorize(auth_args, [&, verifier](auto result, auto code, auto redirect_uri) {
         if (!result.Successful()) {
             std::cerr << "Discord authorization failed: " << result.ToString() << '\n';
             return;
         }
+        std::cout << "Discord authorization approved; exchanging code for token.\n";
         client.GetToken(application_id, code, verifier.Verifier(), redirect_uri,
             [&](auto token_result, auto access_token, auto /*refresh_token*/,
                 auto /*token_type*/, auto /*expires_in*/, auto /*scopes*/) {
