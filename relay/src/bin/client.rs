@@ -174,30 +174,85 @@ fn volume_needs_update(previous: Option<f32>, target: f32) -> bool {
     })
 }
 
+struct GainState {
+    value: f32,
+    last_sent: Option<f32>,
+    updated_at: Instant,
+    positions: Option<(Position, Position)>,
+}
+
+impl GainState {
+    fn muted(now: Instant) -> Self {
+        Self {
+            value: 0.0,
+            last_sent: None,
+            updated_at: now,
+            positions: None,
+        }
+    }
+
+    fn advance(&mut self, positions: Option<(Position, Position)>, now: Instant) -> f32 {
+        let elapsed = now
+            .saturating_duration_since(self.updated_at)
+            .min(Duration::from_millis(100));
+        self.updated_at = now;
+        let Some((local, remote)) =
+            positions.filter(|(local, remote)| local.valid() && remote.valid())
+        else {
+            self.value = 0.0;
+            self.positions = None;
+            return 0.0;
+        };
+        let target = volume_for_distance(local, remote, MAX_DISTANCE);
+        let moved_far = self.positions.is_some_and(|(last_local, last_remote)| {
+            let moved = |a: Position, b: Position| {
+                let dx = f64::from(a.x) - f64::from(b.x);
+                let dy = f64::from(a.y) - f64::from(b.y);
+                let dz = f64::from(a.z) - f64::from(b.z);
+                dx * dx + dy * dy + dz * dz > 20.0 * 20.0
+            };
+            moved(last_local, local) || moved(last_remote, remote)
+        });
+        self.positions = Some((local, remote));
+        if target == 0.0 || (moved_far && target < self.value) {
+            self.value = target;
+        } else {
+            let response = if target < self.value { 0.10 } else { 0.18 };
+            let alpha = 1.0 - (-elapsed.as_secs_f32() / response).exp();
+            self.value += (target - self.value) * alpha;
+            if (target - self.value).abs() < 0.05 {
+                self.value = target;
+            }
+        }
+        self.value
+    }
+}
+
 async fn apply_volumes(
     voice_input: &mut ChildStdin,
     peers: &HashSet<u64>,
-    last_volumes: &mut HashMap<u64, f32>,
+    gains: &mut HashMap<u64, GainState>,
     local: Option<Position>,
     remote: &[Participant],
     remote_fresh: bool,
 ) -> Result<(), String> {
+    let now = Instant::now();
     for peer in peers {
-        let target = if remote_fresh {
-            local
-                .and_then(|local| {
-                    remote
-                        .iter()
-                        .find(|person| person.discord_id == peer.to_string())
-                        .map(|person| volume_for_distance(local, person.position, MAX_DISTANCE))
-                })
-                .unwrap_or(0.0)
+        let positions = if remote_fresh {
+            local.and_then(|local| {
+                remote
+                    .iter()
+                    .find(|person| person.discord_id == peer.to_string())
+                    .map(|person| (local, person.position))
+            })
         } else {
-            0.0
+            None
         };
-        if volume_needs_update(last_volumes.get(peer).copied(), target) {
+        let gain = gains.entry(*peer).or_insert_with(|| GainState::muted(now));
+        let target = gain.advance(positions, now);
+        if volume_needs_update(gain.last_sent, target) {
             write_volume(voice_input, *peer, target).await?;
-            last_volumes.insert(*peer, target);
+            gain.last_sent = Some(target);
         }
     }
     Ok(())
@@ -226,7 +281,7 @@ async fn run_connected(
 
     let mut remote = Vec::<Participant>::new();
     let mut last_snapshot = None::<Instant>;
-    let mut last_volumes = HashMap::<u64, f32>::new();
+    let mut gains = HashMap::<u64, GainState>::new();
     let mut server_id = None::<u64>;
     let mut ticks = interval(Duration::from_millis(50));
     loop {
@@ -258,7 +313,10 @@ async fn run_connected(
                     Some(VoiceEvent::Peer(id)) => {
                         peers.insert(id);
                         write_volume(voice_input, id, 0.0).await?;
-                        last_volumes.insert(id, 0.0);
+                        let gain = gains.entry(id).or_insert_with(|| GainState::muted(Instant::now()));
+                        gain.value = 0.0;
+                        gain.last_sent = Some(0.0);
+                        gain.positions = None;
                     }
                     Some(VoiceEvent::SelfId(id)) => {
                         if server_id.is_some_and(|value| value != id) {
@@ -281,7 +339,7 @@ async fn run_connected(
                     .await.map_err(|error| format!("Relay send failed: {error}"))?;
                 let remote_fresh = server_id.is_some_and(|id| *self_id == Some(id))
                     && last_snapshot.is_some_and(|time| now.saturating_duration_since(time) <= REMOTE_MAX_AGE);
-                apply_volumes(voice_input, peers, &mut last_volumes, local, &remote, remote_fresh).await?;
+                apply_volumes(voice_input, peers, &mut gains, local, &remote, remote_fresh).await?;
             }
         }
     }
@@ -397,5 +455,47 @@ mod tests {
     fn tiny_remaining_volume_is_still_muted() {
         assert!(volume_needs_update(Some(0.2), 0.0));
         assert!(!volume_needs_update(Some(0.0), 0.0));
+    }
+
+    #[test]
+    fn valid_gain_is_smoothed_but_invalid_and_out_of_range_mute_immediately() {
+        let now = Instant::now();
+        let origin = Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let far = Position { x: 60.0, ..origin };
+        let mut gain = GainState::muted(now);
+        assert_eq!(gain.advance(Some((origin, origin)), now), 0.0);
+        let rising = gain.advance(Some((origin, origin)), now + Duration::from_millis(50));
+        assert!(rising > 0.0 && rising < 100.0);
+        assert_eq!(
+            gain.advance(Some((origin, far)), now + Duration::from_millis(100)),
+            0.0
+        );
+        let return_gain = gain.advance(Some((origin, origin)), now + Duration::from_millis(150));
+        assert!(return_gain > 0.0 && return_gain < 100.0);
+        assert_eq!(gain.advance(None, now + Duration::from_millis(200)), 0.0);
+        let recovering = gain.advance(Some((origin, origin)), now + Duration::from_millis(250));
+        assert!(recovering > 0.0 && recovering < 100.0);
+    }
+
+    #[test]
+    fn large_position_jump_does_not_leave_old_gain_audible() {
+        let now = Instant::now();
+        let origin = Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let remote = Position { x: 30.0, ..origin };
+        let mut gain = GainState::muted(now);
+        gain.advance(Some((origin, origin)), now);
+        gain.advance(Some((origin, origin)), now + Duration::from_secs(1));
+        assert_eq!(
+            gain.advance(Some((origin, remote)), now + Duration::from_millis(1050)),
+            25.0
+        );
     }
 }
