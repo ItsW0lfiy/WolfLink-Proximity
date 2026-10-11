@@ -1,4 +1,4 @@
-WolfLink Proximity 0.1.0 Alpha 1 — private pre-release
+WolfLink Proximity 0.1.0 Alpha 2 — experimental pre-release
 
 1. Wolfy and Kasper each sign in to Tailscale. One must share the host device with the other, or both must be allowed by the same Tailnet access rules. No IP address or port forwarding is needed.
 2. Both open the Discord desktop app and launch WolfLink.exe from the extracted folder. Keep the other files next to WolfLink.exe.
@@ -6,6 +6,8 @@ WolfLink Proximity 0.1.0 Alpha 1 — private pre-release
 4. Kasper pastes the invitation and clicks Join Room. Both approve the Discord authorization prompt if asked. Windows Firewall may ask Wolfy to allow the Tailnet-bound host relay.
 5. For the currently testable mode, leave Experimental private room unchecked and enter simulated XYZ positions. Set different positions to hear proximity volume change. Unavailable mutes it.
 
-Real Roblox telemetry is unavailable with the Roblox build observed on 2026-10-11 because its validated memory layout changed. Experimental private-room mode will fail closed and mute proximity audio until the reader is revalidated. Do not mistake a connected Discord call for validated Roblox positions.
+Real Roblox telemetry is unavailable with the Roblox build checked on 2026-10-12 because its validated memory layout changed. Experimental private-room mode will fail closed and mute proximity audio until the reader is revalidated. Do not mistake a connected Discord call for validated Roblox positions.
+
+Alpha 1 cannot update itself. Both users must extract this entire Alpha 2 ZIP once, replacing the old app folder or using a new folder. Keep personal settings in %APPDATA%\WolfLink. Alpha 2 checks signed GitHub releases automatically and installs future compatible updates when the room is idle; the host must remain online during the room.
 
 The invitation expires after 24 hours. Anyone holding it who can access the Tailnet host and authenticates with Discord may join; share it only with trusted friends.
