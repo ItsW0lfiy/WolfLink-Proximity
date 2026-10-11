@@ -214,6 +214,7 @@ fn usage() -> ! {
     );
     eprintln!("  roblox-memory-scanner locate-humanoid-roots [--pid PID]");
     eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ]");
+    eprintln!("  roblox-memory-scanner stream-telemetry [--hz HZ] [--machine]");
     std::process::exit(2);
 }
 
@@ -1553,7 +1554,20 @@ fn unavailable_telemetry(
     }
 }
 
-fn render_telemetry(telemetry: &Telemetry) {
+fn render_telemetry(telemetry: &Telemetry, machine: bool) {
+    if machine {
+        match &telemetry.validity {
+            TelemetryValidity::Valid => println!(
+                "POS {} {} {}",
+                telemetry.x.unwrap(),
+                telemetry.y.unwrap(),
+                telemetry.z.unwrap()
+            ),
+            TelemetryValidity::Unavailable(_) => println!("UNAVAILABLE"),
+        }
+        let _ = std::io::stdout().flush();
+        return;
+    }
     let line = match &telemetry.validity {
         TelemetryValidity::Valid => format!(
             "Local player: {} | X: {} | Y: {} | Z: {}",
@@ -1593,6 +1607,7 @@ fn parse_poll_rate(args: &[String]) -> Result<f64, String> {
 }
 
 fn stream_telemetry(args: &[String]) -> Result<(), String> {
+    let machine = args.iter().any(|arg| arg == "--machine");
     let interval = Duration::from_secs_f64(1.0 / parse_poll_rate(args)?);
     let retry_delay = Duration::from_secs(1);
     let identity_interval = Duration::from_secs(1);
@@ -1603,17 +1618,20 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
 
     loop {
         if target.is_none() {
-            render_telemetry(&unavailable_telemetry(
-                None,
-                TelemetryUnavailableReason::Discovering,
-            ));
+            render_telemetry(
+                &unavailable_telemetry(None, TelemetryUnavailableReason::Discovering),
+                machine,
+            );
             let pid = match requested_pid(&[]) {
                 Ok(pid) => pid,
                 Err(error) => {
-                    render_telemetry(&unavailable_telemetry(
-                        None,
-                        TelemetryUnavailableReason::RobloxUnavailable(error),
-                    ));
+                    render_telemetry(
+                        &unavailable_telemetry(
+                            None,
+                            TelemetryUnavailableReason::RobloxUnavailable(error),
+                        ),
+                        machine,
+                    );
                     thread::sleep(retry_delay);
                     continue;
                 }
@@ -1626,10 +1644,13 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
                     consecutive_copy_disagreements = 0;
                 }
                 Err(error) => {
-                    render_telemetry(&unavailable_telemetry(
-                        None,
-                        TelemetryUnavailableReason::DiscoveryFailed(error),
-                    ));
+                    render_telemetry(
+                        &unavailable_telemetry(
+                            None,
+                            TelemetryUnavailableReason::DiscoveryFailed(error),
+                        ),
+                        machine,
+                    );
                     thread::sleep(retry_delay);
                     continue;
                 }
@@ -1661,10 +1682,13 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
             next_identity_check = Instant::now() + identity_interval;
         }
         if let Some(reason) = invalidate_reason {
-            render_telemetry(&unavailable_telemetry(
-                target.as_ref(),
-                TelemetryUnavailableReason::TargetInvalid(reason),
-            ));
+            render_telemetry(
+                &unavailable_telemetry(
+                    target.as_ref(),
+                    TelemetryUnavailableReason::TargetInvalid(reason),
+                ),
+                machine,
+            );
             target = None;
             continue;
         }
@@ -1673,23 +1697,29 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
         match poll_position(current) {
             Ok(position) => {
                 consecutive_copy_disagreements = 0;
-                render_telemetry(&valid_telemetry(current, position));
+                render_telemetry(&valid_telemetry(current, position), machine);
             }
             Err(PollError::PositionCopiesDisagree) => {
                 consecutive_copy_disagreements += 1;
-                render_telemetry(&unavailable_telemetry(
-                    Some(current),
-                    TelemetryUnavailableReason::PositionCopiesDisagree,
-                ));
+                render_telemetry(
+                    &unavailable_telemetry(
+                        Some(current),
+                        TelemetryUnavailableReason::PositionCopiesDisagree,
+                    ),
+                    machine,
+                );
                 if consecutive_copy_disagreements >= 5 {
                     target = None;
                 }
             }
             Err(PollError::TargetInvalid(error)) => {
-                render_telemetry(&unavailable_telemetry(
-                    Some(current),
-                    TelemetryUnavailableReason::TargetInvalid(error),
-                ));
+                render_telemetry(
+                    &unavailable_telemetry(
+                        Some(current),
+                        TelemetryUnavailableReason::TargetInvalid(error),
+                    ),
+                    machine,
+                );
                 target = None;
             }
         }

@@ -13,6 +13,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <windows.h>
 
 struct CommandQueue {
     std::mutex mutex;
@@ -20,8 +22,10 @@ struct CommandQueue {
 };
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "Usage: wolflink_voice_poc <discord_application_id> <shared_lobby_secret>\n";
+    const bool machine = argc == 4 && std::string(argv[3]) == "--machine";
+    if ((argc != 3 && !machine) ||
+        (machine && GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE)) {
+        std::cerr << "Usage: wolflink_voice_poc <discord_application_id> <shared_lobby_secret> [--machine (piped stdout only)]\n";
         return 2;
     }
 
@@ -50,6 +54,7 @@ int main(int argc, char** argv) {
     bool lobby_requested = false;
     uint64_t self_id = 0;
     bool ready = false;
+    std::unordered_set<uint64_t> seen_participants;
 
     client.SetStatusChangedCallback([&](auto status, auto error, auto detail) {
         ready = status == discordpp::Client::Status::Ready;
@@ -61,6 +66,7 @@ int main(int argc, char** argv) {
         if (!ready) {
             lobby_requested = false;
             call.reset();
+            seen_participants.clear();
             return;
         }
         const auto user = client.GetCurrentUserV2();
@@ -70,6 +76,9 @@ int main(int argc, char** argv) {
         }
         self_id = user->Id();
         std::cout << "Authenticated Discord user ID: " << self_id << '\n';
+        if (machine) {
+            std::cout << "SELF " << self_id << std::endl;
+        }
         if (lobby_requested) return;
         lobby_requested = true;
         client.CreateOrJoinLobby(lobby_secret, [&](auto result, uint64_t lobby_id) {
@@ -92,9 +101,16 @@ int main(int argc, char** argv) {
                               << " (" << detail << ")\n";
                 }
             });
-            call->SetParticipantChangedCallback([](uint64_t user_id, bool added) {
+            call->SetParticipantChangedCallback([&](uint64_t user_id, bool added) {
                 std::cout << "Voice participant " << user_id
                           << (added ? " joined" : " left") << '\n';
+                if (machine && added && user_id != self_id && call) {
+                    call->SetParticipantVolume(user_id, 0.0f);
+                    if (seen_participants.insert(user_id).second) {
+                        std::cout << "PEER " << user_id << std::endl;
+                    }
+                }
+                if (!added) seen_participants.erase(user_id);
             });
             std::cout << "Voice call started. Commands: participants | volume <user_id> <0..200> | quit\n";
         });
@@ -116,6 +132,10 @@ int main(int argc, char** argv) {
                 if (!token_result.Successful()) {
                     std::cerr << "Discord token exchange failed: " << token_result.ToString() << '\n';
                     return;
+                }
+                if (machine) {
+                    // Rust must spawn this process with stdout piped; never echo this line to a terminal.
+                    std::cout << "AUTH " << access_token << std::endl;
                 }
                 client.UpdateToken(discordpp::AuthorizationTokenType::Bearer,
                     access_token, [&](auto update_result) {
@@ -140,6 +160,23 @@ int main(int argc, char** argv) {
 
     while (*running) {
         discordpp::RunCallbacks();
+        if (machine && call && ready) {
+            std::unordered_set<uint64_t> current_participants;
+            for (auto user_id : call->GetParticipants()) {
+                current_participants.insert(user_id);
+                if (user_id != self_id && seen_participants.insert(user_id).second) {
+                    call->SetParticipantVolume(user_id, 0.0f);
+                    std::cout << "PEER " << user_id << std::endl;
+                }
+            }
+            for (auto it = seen_participants.begin(); it != seen_participants.end();) {
+                if (!current_participants.count(*it)) {
+                    it = seen_participants.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         std::queue<std::string> pending;
         {
             std::lock_guard<std::mutex> lock(commands->mutex);
@@ -164,8 +201,10 @@ int main(int argc, char** argv) {
                 if (stream >> user_id >> volume && user_id != self_id &&
                     std::isfinite(volume) && volume >= 0.0f && volume <= 200.0f) {
                     call->SetParticipantVolume(user_id, volume);
-                    std::cout << "Participant " << user_id << " volume set to "
-                              << call->GetParticipantVolume(user_id) << '\n';
+                    if (!machine) {
+                        std::cout << "Participant " << user_id << " volume set to "
+                                  << call->GetParticipantVolume(user_id) << '\n';
+                    }
                 } else {
                     std::cerr << "Usage: volume <other_user_id> <0..200>\n";
                 }

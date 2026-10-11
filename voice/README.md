@@ -25,3 +25,5 @@ Status: source prepared against Discord's published C++ API; not compiled or liv
 6. Authenticate each PC with a different Discord account. The program prints the Discord user ID and voice participant IDs. Speak into one microphone and listen on the other PC. To prove local volume control, enter `volume <other_user_id> 0`, then `volume <other_user_id> 100`. `participants` lists current call users; `quit` exits.
 
 The SDK owns capture and playback. No Discord token or client secret should be entered on the command line. This program currently reauthorizes at startup and does not persist tokens.
+
+The Rust relay client starts this executable with `--machine`, using a private stdout pipe for the short-lived OAuth token and stdin for volume commands. `--machine` refuses to run with terminal stdout. New voice participants are muted before their IDs are sent to the Rust client; the Rust client unmutes them only after authenticated relay identities and fresh matching-session positions are available. The bridge must be built against the exact SDK package supplied by Discord; its build, API compatibility, and live audio remain unverified until that package is available.

@@ -1,6 +1,8 @@
-# Roblox read-only telemetry reader
+# WolfLink Proximity
 
-This project discovers the running Roblox process, identifies the local player's character, and reads its world position without modifying or controlling Roblox.
+WolfLink is an in-progress Discord-powered proximity-voice client. The Roblox reader discovers the running process, identifies the local player's character, and reads its world position without modifying or controlling Roblox. The Discord voice bridge and authenticated telemetry relay are separate components; see [voice/README.md](voice/README.md) and [relay/README.md).
+
+The relay and attenuation logic have automated tests. Live Discord voice is not yet verified: a Discord Developer application, its Social SDK download, a second authenticated PC, and a hosted `wss://` relay are still needed. Simulated coordinates can be used to test the voice/network path before enabling Roblox telemetry.
 
 ## Run
 
@@ -73,6 +75,6 @@ Coordinates and timestamps are populated only for `TelemetryValidity::Valid`. In
 - The current class RVAs and field offsets are version-specific. Every class RVA is checked against its RTTI name before use; an incompatible Roblox update fails explicitly instead of returning guessed telemetry.
 - A one-shot discovery currently scans roughly 2.3 GiB of readable private memory twice and takes about four seconds on this system.
 - Local-player selection currently requires exactly one character Model name to match exactly one `RBX::Player` instance. This is intentionally fail-closed for the current single-player test environment rather than guessing in an ambiguous multiplayer process.
-- No networking or Discord integration is included yet.
+- The reader's `stream-telemetry --machine` output is consumed by the Rust client. It emits only validated `POS X Y Z` samples or `UNAVAILABLE`; malformed output is treated as unavailable. The reader still has no Roblox game-instance identifier, so its positions cannot yet be safely matched to an actual multiplayer game session without an independently verified session key.
 
 Diagnostic commands are available through `target\release\roblox-memory-scanner.exe` for memory surveys, CFrame snapshots, vector tracking, RTTI classification, pointer ownership, and object inspection.
