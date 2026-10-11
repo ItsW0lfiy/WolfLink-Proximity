@@ -1,6 +1,6 @@
 # Networking design and current boundary
 
-Status: design for the next implementation increment, not a working direct-P2P release. The validated two-PC path still uses the authenticated outbound WebSocket relay with simulated positions. No permanent relay, direct data channel, automatic room invitation, or Tailscale transport is implemented yet.
+Status: design for the next implementation increment, not a working direct-P2P release. The validated two-PC path still uses the authenticated outbound WebSocket relay with simulated positions. An isolated [local WebRTC data-channel probe](p2p-probe/README.md) passes over loopback; no integrated remote data channel, permanent relay, automatic room invitation, or Tailscale transport is implemented yet.
 
 ## Intended private-room path
 
