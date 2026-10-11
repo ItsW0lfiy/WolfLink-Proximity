@@ -12,9 +12,9 @@ use tokio::time::{Duration, interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use wolflink_relay::invitation::{Invitation, RoomMode, unix_now};
 use wolflink_relay::tailscale::{parse_local_status, status_json, verify_peer_status};
+use wolflink_relay::telemetry::{ProviderSet, Source, Telemetry};
 use wolflink_relay::{ClientMessage, Participant, Position, ServerMessage, volume_for_distance};
 
-const LOCAL_MAX_AGE: Duration = Duration::from_millis(500);
 const REMOTE_MAX_AGE: Duration = Duration::from_millis(500);
 const MAX_DISTANCE: f32 = 60.0;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -183,7 +183,7 @@ fn parse_reader_line(line: &str, now: Instant) -> Option<Sample> {
     })
 }
 
-async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Option<Sample>>) {
+async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Telemetry>) {
     let mut last_username = None::<String>;
     eprintln!("Roblox telemetry unavailable; discovering local player");
     loop {
@@ -217,7 +217,40 @@ async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Opt
                 }
                 if let Some(stdout) = child.stdout.take() {
                     let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    let mut silent_ticks = 0u32;
+                    loop {
+                        let line = match tokio::time::timeout(
+                            Duration::from_millis(600),
+                            lines.next_line(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(line))) => {
+                                silent_ticks = 0;
+                                line
+                            }
+                            Ok(_) => break,
+                            Err(_) => {
+                                if last_username.take().is_some() {
+                                    eprintln!(
+                                        "Roblox telemetry unavailable (reader stopped publishing)"
+                                    );
+                                    let _ = samples.send(Telemetry::unavailable(
+                                        Source::ReadOnlyMemory,
+                                        "Reader sample expired",
+                                    ));
+                                }
+                                silent_ticks += 1;
+                                if silent_ticks >= 50 {
+                                    eprintln!(
+                                        "Roblox reader stopped responding; restarting read-only reader"
+                                    );
+                                    let _ = child.kill().await;
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
                         let sample = parse_reader_line(&line, Instant::now())
                             .filter(|value| value.username == username);
                         if let Some(value) = &sample
@@ -229,26 +262,43 @@ async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Opt
                         if sample.is_none() && last_username.take().is_some() {
                             eprintln!("Roblox telemetry unavailable");
                         }
-                        let _ = samples.send(sample);
+                        let result = match sample {
+                            Some(sample) => Telemetry::validated(
+                                Source::ReadOnlyMemory,
+                                Some(sample.username),
+                                None,
+                                sample.position,
+                                None,
+                                sample.received_at,
+                            ),
+                            None => Telemetry::unavailable(
+                                Source::ReadOnlyMemory,
+                                "Reader did not provide validated local position",
+                            ),
+                        };
+                        let _ = samples.send(result);
                     }
                 }
                 last_username = None;
-                let _ = samples.send(None);
+                let _ = samples.send(Telemetry::unavailable(
+                    Source::ReadOnlyMemory,
+                    "Reader disconnected",
+                ));
                 let _ = child.wait().await;
             }
             Err(error) => {
                 eprintln!("Could not start read-only telemetry reader: {error}");
-                let _ = samples.send(None);
+                let _ = samples.send(Telemetry::unavailable(
+                    Source::ReadOnlyMemory,
+                    "Reader could not start",
+                ));
             }
         }
         sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn input_task(
-    samples: Option<watch::Sender<Option<Sample>>>,
-    controls: mpsc::Sender<Control>,
-) {
+async fn input_task(samples: Option<watch::Sender<Telemetry>>, controls: mpsc::Sender<Control>) {
     if samples.is_some() {
         eprintln!("Simulated telemetry: type 'position X Y Z', 'unavailable', or 'quit'.");
     }
@@ -276,28 +326,33 @@ async fn input_task(
                 let Some(samples) = &samples else { eprintln!("Unknown control command"); continue; };
                 if line.trim() == "unavailable" {
                     position = None;
-                    let _ = samples.send(None);
+                    let _ = samples.send(Telemetry::unavailable(Source::Simulated, "User marked unavailable"));
                     continue;
                 }
                 if let Some(sample) = line.strip_prefix("position ")
                     .and_then(|coordinates| parse_reader_line(&format!("POS simulated {coordinates}"), Instant::now())) {
                     position = Some(sample.position);
-                    let _ = samples.send(Some(sample));
+                    let _ = samples.send(Telemetry::validated(
+                        Source::Simulated, None, None, sample.position, None, Instant::now()));
                 } else {
                     position = None;
-                    let _ = samples.send(None);
+                    let _ = samples.send(Telemetry::unavailable(Source::Simulated, "Invalid test position"));
                     eprintln!("Expected: position X Y Z | unavailable | quit");
                 }
             }
             _ = ticks.tick() => {
                 if let (Some(samples), Some(position)) = (&samples, position) {
-                    let _ = samples.send(Some(Sample { username: "simulated".into(), position, received_at: Instant::now() }));
+                    let _ = samples.send(Telemetry::validated(
+                        Source::Simulated, None, None, position, None, Instant::now()));
                 }
             }
         }
     }
     if let Some(samples) = samples {
-        let _ = samples.send(None);
+        let _ = samples.send(Telemetry::unavailable(
+            Source::Simulated,
+            "Control input disconnected",
+        ));
     }
     let _ = controls.send(Control::Quit).await;
 }
@@ -327,11 +382,17 @@ async fn apply_control(
     }
 }
 
-fn sample_is_fresh(sample: Option<Sample>, now: Instant) -> Option<Position> {
-    sample.and_then(|value| {
-        (now.saturating_duration_since(value.received_at) <= LOCAL_MAX_AGE)
-            .then_some(value.position)
-    })
+fn sample_is_fresh(
+    sample: Telemetry,
+    now: Instant,
+    expected: Option<&str>,
+    simulated: bool,
+) -> Option<Position> {
+    let mut providers = ProviderSet::default();
+    providers.publish(sample);
+    providers
+        .position(now, expected, simulated)
+        .map(|(_, position)| position)
 }
 
 async fn write_volume(
@@ -443,7 +504,7 @@ async fn apply_volumes(
 async fn run_connected(
     config: &Config,
     token: &str,
-    samples: &watch::Receiver<Option<Sample>>,
+    samples: &watch::Receiver<Telemetry>,
     voice_events: &mut mpsc::Receiver<VoiceEvent>,
     voice_input: &mut ChildStdin,
     peers: &mut HashSet<u64>,
@@ -549,7 +610,10 @@ async fn run_connected(
                 let now = Instant::now();
                 let tail_fresh = config.invitation.is_none()
                     || now.saturating_duration_since(last_tail_verified) <= Duration::from_secs(7);
-                let local = if tail_fresh { sample_is_fresh(samples.borrow().clone(), now) } else { None };
+                let local = if tail_fresh {
+                    sample_is_fresh(samples.borrow().clone(), now,
+                        config.username.as_deref(), config.telemetry_exe.is_none())
+                } else { None };
                 let outbound = match local {
                     Some(position) => ClientMessage::Position { position },
                     None => ClientMessage::Unavailable,
@@ -567,7 +631,15 @@ async fn run_connected(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
-    let (samples_tx, samples_rx) = watch::channel(None::<Sample>);
+    let initial_source = if config.telemetry_exe.is_some() {
+        Source::ReadOnlyMemory
+    } else {
+        Source::Simulated
+    };
+    let (samples_tx, samples_rx) = watch::channel(Telemetry::unavailable(
+        initial_source,
+        "Provider is starting",
+    ));
     let (controls_tx, mut controls_rx) = mpsc::channel::<Control>(32);
     let loudness = AtomicU16::new(config.loudness_percent);
     let telemetry_task = config.telemetry_exe.as_ref().map(|path| {
@@ -688,16 +760,19 @@ mod tests {
     #[test]
     fn stale_local_sample_is_muted() {
         let now = Instant::now();
-        let sample = Sample {
-            username: "test".into(),
-            position: Position {
+        let sample = Telemetry::validated(
+            Source::ReadOnlyMemory,
+            Some("test".into()),
+            None,
+            Position {
                 x: 1.0,
                 y: 2.0,
                 z: 3.0,
             },
-            received_at: now - Duration::from_millis(501),
-        };
-        assert!(sample_is_fresh(Some(sample), now).is_none());
+            None,
+            now - Duration::from_millis(501),
+        );
+        assert!(sample_is_fresh(sample, now, Some("test"), false).is_none());
     }
 
     #[test]

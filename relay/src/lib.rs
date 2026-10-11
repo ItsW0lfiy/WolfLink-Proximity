@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 pub mod invitation;
 pub mod tailscale;
+pub mod telemetry;
 
 pub const MAX_POSITION_AGE: Duration = Duration::from_millis(500);
 pub const MAX_COORDINATE: f32 = 1_000_000.0;
