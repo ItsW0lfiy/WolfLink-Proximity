@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$output = Join-Path $project 'dist\WolfLink-0.1.0-dev'
+$output = Join-Path $project 'dist\WolfLink-0.1.0-alpha.1'
 $rust = Join-Path $project 'target\release'
 $voice = Join-Path $project 'voice\build\Release'
 $files = @(
@@ -41,7 +41,9 @@ $hashes = Get-ChildItem -LiteralPath $output -File |
     Sort-Object Name |
     ForEach-Object { "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
 Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value $hashes -Encoding ascii
-$archive = Join-Path $project 'dist\WolfLink-0.1.0-dev.zip'
+$archive = Join-Path $project 'dist\WolfLink-0.1.0-alpha.1.zip'
 Compress-Archive -Path (Join-Path $output '*') -DestinationPath $archive -Force
-Write-Output "Development build: $output\WolfLink.exe"
+$archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath (Join-Path $project 'dist\SHA256SUMS.txt') -Value "$archiveHash  $(Split-Path $archive -Leaf)" -Encoding ascii
+Write-Output "Private alpha build: $output\WolfLink.exe"
 Write-Output "Portable archive: $archive"

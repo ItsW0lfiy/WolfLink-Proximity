@@ -1,4 +1,4 @@
-WolfLink Proximity 0.1.0 — private development build
+WolfLink Proximity 0.1.0 Alpha 1 — private pre-release
 
 1. Wolfy and Kasper each sign in to Tailscale. One must share the host device with the other, or both must be allowed by the same Tailnet access rules. No IP address or port forwarding is needed.
 2. Both open the Discord desktop app and launch WolfLink.exe from the extracted folder. Keep the other files next to WolfLink.exe.

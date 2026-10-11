@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "roblox-memory-scanner"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "rtc"
@@ -2488,7 +2488,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wolflink-app"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "wolflink-p2p-probe"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "wolflink-relay"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
