@@ -8,6 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, interval, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use wolflink_relay::invitation::{Invitation, unix_now};
+use wolflink_relay::tailscale::{parse_local_status, status_json};
 use wolflink_relay::{ClientMessage, RoomKey, Rooms, ServerMessage};
 
 #[derive(Deserialize)]
@@ -34,6 +36,13 @@ struct Server {
     app_id: String,
     auth_url: String,
     next_connection_id: Arc<AtomicU64>,
+    hosted_room: Option<HostedRoom>,
+}
+
+#[derive(Clone)]
+struct HostedRoom {
+    key: RoomKey,
+    expires_at: u64,
 }
 
 impl Server {
@@ -130,6 +139,18 @@ async fn handle(stream: TcpStream, server: Server) {
         .await;
         return;
     };
+    if server.hosted_room.as_ref().is_some_and(|hosted| {
+        hosted.key != room || unix_now().map_or(true, |now| now >= hosted.expires_at)
+    }) {
+        let _ = send(
+            &mut ws,
+            ServerMessage::Error {
+                message: "room invitation is invalid or expired".into(),
+            },
+        )
+        .await;
+        return;
+    }
     let discord_id = match server.authenticate(&access_token).await {
         Ok(id) => id,
         Err(error) => {
@@ -198,6 +219,9 @@ async fn handle(stream: TcpStream, server: Server) {
                 }
             }
             _ = ticks.tick() => {
+                if server.hosted_room.as_ref().is_some_and(|hosted| unix_now().map_or(true, |now| now >= hosted.expires_at)) {
+                    break;
+                }
                 let participants = server.rooms.lock().await.snapshot(&room, &discord_id, Instant::now());
                 if !send(&mut ws, ServerMessage::Snapshot { participants }).await { break; }
             }
@@ -217,21 +241,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app_id
         .parse::<u64>()
         .map_err(|_| "invalid Discord application ID")?;
-    let bind = env::var("WOLFLINK_RELAY_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into());
+    let hosted = env::var("WOLFLINK_ROOM_INVITE")
+        .ok()
+        .map(|encoded| Invitation::decode(&encoded, unix_now()?))
+        .transpose()?;
+    let bind = if let Some(invitation) = &hosted {
+        if invitation.application_id.to_string() != app_id {
+            return Err("Hosted invitation application ID does not match".into());
+        }
+        let local = parse_local_status(&status_json()?)?;
+        if local.address != invitation.host_address || local.public_key != invitation.host_key {
+            return Err("Hosted invitation does not match the current Tailscale device".into());
+        }
+        format!("{}:{}", local.address, invitation.port)
+    } else {
+        env::var("WOLFLINK_RELAY_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into())
+    };
     let listener = TcpListener::bind(&bind).await?;
+    let hosted_room = hosted.as_ref().map(|invitation| HostedRoom {
+        key: RoomKey::new(&invitation.room_secret, &invitation.session_key)
+            .expect("validated invitation room"),
+        expires_at: invitation.expires_at,
+    });
     let server = Server {
         rooms: Arc::new(Mutex::new(Rooms::default())),
         http: reqwest::Client::builder().build()?,
         app_id,
         auth_url: "https://discord.com/api/v10/oauth2/@me".into(),
         next_connection_id: Arc::new(AtomicU64::new(1)),
+        hosted_room,
     };
     println!("WolfLink relay listening on {bind}");
+    let mut checks = interval(Duration::from_secs(5));
     loop {
-        let (stream, _) = listener.accept().await?;
-        let server = server.clone();
-        tokio::spawn(handle(stream, server));
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let server = server.clone();
+                tokio::spawn(handle(stream, server));
+            }
+            _ = checks.tick(), if server.hosted_room.is_some() => {
+                if server.hosted_room.as_ref().is_some_and(|hosted| unix_now().map_or(true, |now| now >= hosted.expires_at)) {
+                    break;
+                }
+                let local = parse_local_status(&status_json()?);
+                if hosted.as_ref().is_some_and(|invitation| local.map_or(true, |local| local.address != invitation.host_address || local.public_key != invitation.host_key)) {
+                    return Err("Tailscale host identity or connection changed".into());
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -278,7 +338,7 @@ mod tests {
         format!("http://{address}/oauth2/@me")
     }
 
-    async fn test_relay(auth_url: String) -> String {
+    async fn test_relay_with_room(auth_url: String, hosted_room: Option<HostedRoom>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = Server {
@@ -287,6 +347,7 @@ mod tests {
             app_id: "1234".into(),
             auth_url,
             next_connection_id: Arc::new(AtomicU64::new(1)),
+            hosted_room,
         };
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -294,6 +355,10 @@ mod tests {
             }
         });
         format!("ws://{address}")
+    }
+
+    async fn test_relay(auth_url: String) -> String {
+        test_relay_with_room(auth_url, None).await
     }
 
     async fn connect(
@@ -369,5 +434,35 @@ mod tests {
         let mut ws = connect(&url, "invalid", "private-abcdefghijkl", "server-1").await;
         let error = next_json(&mut ws).await;
         assert_eq!(error["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn hosted_relay_rejects_other_rooms_and_expired_invites() {
+        let secret = "private-abcdefghijkl";
+        let session = "server-1";
+        let key = RoomKey::new(secret, session).unwrap();
+        let url = test_relay_with_room(
+            fake_discord().await,
+            Some(HostedRoom {
+                key: key.clone(),
+                expires_at: unix_now().unwrap() + 60,
+            }),
+        )
+        .await;
+        let mut other = connect(&url, "token-a", "private-qrstuvwxyz01", session).await;
+        assert_eq!(next_json(&mut other).await["type"], "error");
+        let mut accepted = connect(&url, "token-a", secret, session).await;
+        assert_eq!(next_json(&mut accepted).await["type"], "welcome");
+
+        let expired = test_relay_with_room(
+            fake_discord().await,
+            Some(HostedRoom {
+                key,
+                expires_at: unix_now().unwrap() - 1,
+            }),
+        )
+        .await;
+        let mut rejected = connect(&expired, "token-b", secret, session).await;
+        assert_eq!(next_json(&mut rejected).await["type"], "error");
     }
 }

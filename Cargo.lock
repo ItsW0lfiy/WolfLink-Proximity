@@ -2500,7 +2500,9 @@ dependencies = [
 name = "wolflink-relay"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "futures-util",
+ "getrandom 0.4.3",
  "reqwest",
  "serde",
  "serde_json",
