@@ -1659,6 +1659,9 @@ fn stream_telemetry(args: &[String]) -> Result<(), String> {
                     consecutive_copy_disagreements = 0;
                 }
                 Err(error) => {
+                    if machine {
+                        eprintln!("Roblox discovery failed: {error}");
+                    }
                     render_telemetry(
                         &unavailable_telemetry(
                             None,

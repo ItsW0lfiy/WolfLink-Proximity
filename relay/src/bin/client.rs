@@ -198,11 +198,23 @@ async fn reader_task(path: PathBuf, username: String, samples: watch::Sender<Opt
                 &username,
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn();
         match child {
             Ok(mut child) => {
+                if let Some(stderr) = child.stderr.take() {
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(stderr).lines();
+                        let mut previous = String::new();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if line != previous {
+                                eprintln!("Roblox reader: {line}");
+                                previous = line;
+                            }
+                        }
+                    });
+                }
                 if let Some(stdout) = child.stdout.take() {
                     let mut lines = BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
