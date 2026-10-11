@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
                 }
                 if (!added) seen_participants.erase(user_id);
             });
-            std::cout << "Voice call started. Commands: participants | volume <user_id> <0..200> | quit\n";
+            std::cout << "Voice call started. Commands: participants | volume <user_id> <0..200> | self-mute on|off | self-deaf on|off | quit\n";
         });
     });
 
@@ -208,6 +208,24 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     std::cerr << "Usage: volume <other_user_id> <0..200>\n";
+                }
+            } else if (command == "self-mute" && call && !machine) {
+                std::string value;
+                stream >> value;
+                if (value == "on" || value == "off") {
+                    call->SetSelfMute(value == "on");
+                    std::cout << "Self mute=" << (call->GetSelfMute() ? "on" : "off") << '\n';
+                } else {
+                    std::cerr << "Usage: self-mute on|off\n";
+                }
+            } else if (command == "self-deaf" && call && !machine) {
+                std::string value;
+                stream >> value;
+                if (value == "on" || value == "off") {
+                    call->SetSelfDeaf(value == "on");
+                    std::cout << "Self deaf=" << (call->GetSelfDeaf() ? "on" : "off") << '\n';
+                } else {
+                    std::cerr << "Usage: self-deaf on|off\n";
                 }
             } else if (!command.empty()) {
                 std::cerr << "Unknown command or call not ready\n";
