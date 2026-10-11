@@ -2,6 +2,7 @@
 #include "discordpp.h"
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -20,6 +21,15 @@ struct CommandQueue {
     std::mutex mutex;
     std::queue<std::string> lines;
 };
+
+bool valid_signal_payload(const std::string& payload) {
+    if (payload.empty() || payload.size() > 1700) return false;
+    for (char c : payload) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
+    }
+    return true;
+}
 
 int main(int argc, char** argv) {
     const bool machine = argc == 4 && std::string(argv[3]) == "--machine";
@@ -53,7 +63,32 @@ int main(int argc, char** argv) {
     bool lobby_requested = false;
     uint64_t self_id = 0;
     bool ready = false;
+    uint64_t active_lobby_id = 0;
     std::unordered_set<uint64_t> seen_participants;
+    auto last_signal = std::chrono::steady_clock::time_point{};
+
+    client.SetMessageCreatedCallback([&](uint64_t message_id) {
+        if (!machine || !ready || active_lobby_id == 0) return;
+        auto message = client.GetMessageHandle(message_id);
+        if (!message || message->AuthorId() == self_id ||
+            !seen_participants.count(message->AuthorId())) return;
+        auto lobby = message->Lobby();
+        if (!lobby || lobby->Id() != active_lobby_id) return;
+        if (lobby->LinkedChannel()) return;
+        const std::string content = message->RawContent();
+        if (content.rfind("WL1:", 0) != 0) return;
+        const auto separator = content.find(':', 4);
+        if (separator == std::string::npos) return;
+        uint64_t recipient = 0;
+        const char* start = content.data() + 4;
+        const char* end = content.data() + separator;
+        const auto parsed = std::from_chars(start, end, recipient);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) return;
+        const std::string payload = content.substr(separator + 1);
+        if (recipient == self_id && valid_signal_payload(payload)) {
+            std::cout << "SIGNAL " << message->AuthorId() << ' ' << payload << std::endl;
+        }
+    });
 
     client.SetStatusChangedCallback([&](auto status, auto error, auto detail) {
         ready = status == discordpp::Client::Status::Ready;
@@ -64,6 +99,7 @@ int main(int argc, char** argv) {
         }
         if (!ready) {
             lobby_requested = false;
+            active_lobby_id = 0;
             call.reset();
             seen_participants.clear();
             return;
@@ -86,6 +122,7 @@ int main(int argc, char** argv) {
                 std::cerr << "Lobby join failed: " << result.ToString() << '\n';
                 return;
             }
+            active_lobby_id = lobby_id;
             std::cout << "Joined lobby " << lobby_id << '\n';
             auto started = client.StartCall(lobby_id);
             if (!started) {
@@ -208,6 +245,37 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     std::cerr << "Usage: volume <other_user_id> <0..200>\n";
+                }
+            } else if (command == "signal" && machine && ready && active_lobby_id != 0) {
+                uint64_t recipient = 0;
+                std::string recipient_text;
+                std::string payload;
+                std::string extra;
+                stream >> recipient_text >> payload;
+                const auto parsed = std::from_chars(recipient_text.data(),
+                    recipient_text.data() + recipient_text.size(), recipient);
+                if (!recipient_text.empty() && parsed.ec == std::errc{} &&
+                    parsed.ptr == recipient_text.data() + recipient_text.size() &&
+                    !(stream >> extra) && recipient != 0 && recipient != self_id &&
+                    seen_participants.count(recipient) && valid_signal_payload(payload)) {
+                    auto lobby = client.GetLobbyHandle(active_lobby_id);
+                    if (!lobby || lobby->LinkedChannel()) {
+                        std::cerr << "Lobby signaling unavailable for a linked or missing lobby\n";
+                    } else if (const auto now = std::chrono::steady_clock::now();
+                               now - last_signal < std::chrono::milliseconds(500)) {
+                        std::cerr << "Lobby signaling rate limited\n";
+                    } else {
+                        last_signal = now;
+                        client.SendLobbyMessage(active_lobby_id,
+                            "WL1:" + std::to_string(recipient) + ':' + payload,
+                            [](auto result, uint64_t /*message_id*/) {
+                                if (!result.Successful()) {
+                                    std::cerr << "Lobby signaling failed: " << result.ToString() << '\n';
+                                }
+                            });
+                    }
+                } else {
+                    std::cerr << "Invalid lobby signaling command\n";
                 }
             } else if (command == "self-mute" && call && !machine) {
                 std::string value;

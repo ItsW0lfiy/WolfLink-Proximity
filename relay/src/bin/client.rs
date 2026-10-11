@@ -317,6 +317,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id.parse().ok().map(VoiceEvent::SelfId)
             } else if let Some(id) = line.strip_prefix("PEER ") {
                 id.parse().ok().map(VoiceEvent::Peer)
+            } else if line.starts_with("SIGNAL ") {
+                // Negotiation is not enabled yet; do not log encoded peer candidates.
+                None
             } else {
                 eprintln!("Voice: {line}");
                 None
