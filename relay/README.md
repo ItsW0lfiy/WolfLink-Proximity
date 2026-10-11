@@ -13,6 +13,14 @@ cargo run -p wolflink-relay --bin server
 
 The default listener is `127.0.0.1:8765`. It is plain WebSocket for local development. A public deployment must terminate TLS and expose a `wss://` endpoint through a managed reverse proxy; clients never need port forwarding or VPN setup. `WOLFLINK_RELAY_BIND` configures the server-side listener only.
 
+For a temporary two-PC development test without inbound ports, run the local relay and expose its loopback listener with [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/):
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+Use the printed `trycloudflare.com` hostname as a `wss://` client URL. Quick Tunnels have no uptime guarantee or stable hostname and are not a production deployment. Discord OAuth tokens and simulated coordinates pass through the tunnel provider, so use this only for a consented test.
+
 ## Client prototype
 
 Build the Rust client and relay with `cargo build --release -p wolflink-relay --bins`. After building the [Discord voice bridge](../voice/README.md), run this on each PC with the same application ID, room secret, game-session key, and hosted relay URL:
@@ -41,4 +49,6 @@ The application must never use a public Roblox place ID alone as the game-sessio
 
 ## Current verification
 
-Unit tests cover private room and session separation, duplicate identities, invalid coordinates, 500 ms expiry, distance attenuation, and client fail-closed parsing/muting. WebSocket integration tests use a fake local Discord authorization endpoint to verify multiple users, room isolation, and token rejection. A one-user loopback test verified live Discord authentication against `/oauth2/@me`, a matching SDK identity, and a connected SDK call while using simulated telemetry. Two-person audio, audible volume changes, and public `wss://` deployment remain unverified.
+Unit tests cover private room and session separation, duplicate identities, invalid coordinates, 500 ms expiry, distance attenuation, and client fail-closed parsing/muting. WebSocket integration tests use a fake local Discord authorization endpoint to verify multiple users, room isolation, and token rejection. A one-user loopback test verified live Discord authentication against `/oauth2/@me`, a matching SDK identity, and a connected SDK call while using simulated telemetry.
+
+A live two-PC test used different Discord accounts, simulated positions, the combined Rust client on both PCs, and a temporary Cloudflare Quick Tunnel to the local relay. Laptop speech was audible on the PC at distance 0, quiet at 30 studs, silent at 100 studs (past the 60-stud cutoff), silent when local telemetry became `unavailable`, and audible again after restoring a valid position. The standalone voice bridge also passed two-way speech and an audible manual participant-volume 0/100 test. This does **not** verify a stable production `wss://` host, reliable Roblox game-session identity, or Roblox-derived proximity across two PCs.

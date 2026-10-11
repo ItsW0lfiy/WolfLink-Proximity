@@ -2,7 +2,7 @@
 
 This small C++ program uses the Discord Social SDK to authenticate a user, join a shared lobby, start a voice call, and adjust one participant's local playback volume. It does not depend on Roblox or the telemetry reader.
 
-Status: built against Discord Social SDK 1.10.19337 on Windows x64. Two different Discord accounts on two Windows PCs authenticated, joined the same lobby, and reached call status `Connected`. Laptop microphone speech was audible on the PC at participant volume 100, silent at 0, and audible again at 100 with the laptop microphone settings unchanged. This verifies one-way live speech and audible local volume control. The reverse direction and distance-driven relay path still need a clean two-PC test.
+Status: built against Discord Social SDK 1.10.19337 on Windows x64. Two different Discord accounts on two Windows PCs authenticated, joined the same lobby, and reached call status `Connected`. Speech was audible in both directions. Laptop microphone speech was audible on the PC at participant volume 100, silent at 0, and audible again at 100 with the laptop microphone settings unchanged. This verifies live two-way speech and audible local volume control. The distance-driven relay path still needs a clean two-PC test.
 
 ## Setup
 
